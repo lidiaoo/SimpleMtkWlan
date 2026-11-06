@@ -137,8 +137,8 @@ although 5 GHz networks can still be joined from the menu.
 Longer bilingual write-up (Chinese + English, including the dead ends we ruled
 out): [laobamac/SimpleMtkWlan#9 comment](https://github.com/laobamac/SimpleMtkWlan/issues/9#issuecomment-6681009999).
 
-<details>
-<summary><b>中文版实测记录（点此展开 / click to expand）</b></summary>
+<details open>
+<summary><b>中文版实测记录</b></summary>
 
 #### MT7921（`14c3:7961`）在 Tahoe 上的实测
 
