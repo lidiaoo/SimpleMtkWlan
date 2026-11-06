@@ -6,152 +6,85 @@
   Copyright © 2026 laobamac (王孝慈). All rights reserved.
 -->
 
+**简体中文** ｜ [English](README.en.md)
+
 # SimpleMtkWlan
 
 [![Build](https://github.com/e5u/SimpleMtkWlan/actions/workflows/build.yml/badge.svg)](https://github.com/e5u/SimpleMtkWlan/actions/workflows/build.yml)
 [![Release](https://img.shields.io/github/v/release/e5u/SimpleMtkWlan)](https://github.com/e5u/SimpleMtkWlan/releases)
 [![License: GPL v2](https://img.shields.io/badge/license-GPLv2-blue.svg)](LICENSE)
 
-**Wi-Fi for MediaTek MT7921 / MT7921K (AMD RZ608) / MT7922 PCIe cards on macOS.**
+**让 MediaTek MT7921 / MT7921K（AMD RZ608）/ MT7922 PCIe 无线网卡在 macOS 上跑起来。**
 
-An experimental macOS kernel extension, based on the OpenBSD `mwx(4)` driver and
-the itlwm-style `net80211` port. It comes in two flavours with the same
-hardware layer:
+一个实验性的 macOS 内核扩展，基于 OpenBSD 的 `mwx(4)` 驱动与 itlwm 风格的 `net80211` 移植。
+两种形态共用同一套硬件层：
 
-* **`AirportMtkWlan.kext`** — the card is a real macOS Wi-Fi interface: the
-  native Wi-Fi menu, System Settings, private Wi-Fi addresses, Keychain
-  passwords. Built for **macOS 26 Tahoe** (and Sequoia 15.2+), no OCLP root
-  patch, no IOSkywalkFamily downgrade.
-* **`SimpleMtkWlan.kext`** — the card is an Ethernet interface (`enX`);
-  networks are scanned and joined with the
-  [SimpleMTK](https://github.com/laobamac/SimpleMTKClient) menu-bar client.
-  Works on any macOS version the kext loads on.
+* **`AirportMtkWlan.kext`** —— 网卡是一块真正的 macOS Wi-Fi 接口：原生 Wi-Fi 菜单、系统设置、
+  私有 Wi-Fi 地址、钥匙串里保存的密码。为 **macOS 26 Tahoe**（以及 Sequoia 15.2+）构建，
+  不需要 OCLP root patch，也不需要降级 IOSkywalkFamily。
+* **`SimpleMtkWlan.kext`** —— 网卡表现为一块以太网接口（`enX`），由
+  [SimpleMTK](https://github.com/laobamac/SimpleMTKClient) 菜单栏客户端负责扫描和连接。
+  凡是这个 kext 能加载的 macOS 版本都能用。
 
-> **Bluetooth** for the same card: **[SimpleMtkBtFw](https://github.com/flxxxxddd/SimpleMtkBtFw)**
-> (firmware loader + patcher; AirPods audio works).
+> **同一张卡的蓝牙**：**[SimpleMtkBtFw](https://github.com/flxxxxddd/SimpleMtkBtFw)**
+> （固件加载器 + 补丁；AirPods 音频可用）。
 
-> This fork contains the fixes needed to make **MT7921 / RZ608** actually work
-> (it was attaching but never passing traffic), plus 802.11n, 802.11ac
-> (VHT80) and the native Wi-Fi menu on Tahoe. See
-> [What changed in this fork](#what-changed-in-this-fork).
+> 本仓库包含让 **MT7921 / RZ608** 真正可用的修复（此前它能 attach，但完全不通数据），
+> 以及在 Tahoe 上补齐的 802.11n、802.11ac（VHT80）和原生 Wi-Fi 菜单。
+> 见 [本 fork 改了什么](#本-fork-改了什么)。
 
-> **In this fork (`lidiaoo/SimpleMtkWlan`):** added a verified field report for
-> `14c3:7961` (MT7921) on macOS 26.7.2 Tahoe with measured throughput and the
-> two pitfalls that cost us days. English + 中文（可折叠）. See
-> [Field report](#field-report-mt7921-14c37961-on-tahoe).
+> **本仓库（`lidiaoo/SimpleMtkWlan`）额外补充**：`14c3:7961`（MT7921）在 macOS 26.7.2 Tahoe
+> 上的实测记录，含吞吐数据和两个害我们多花好几天的坑。
+> 见 [实测记录](#实测记录mt7921-在-tahoe-上)。英文版见 [README.en.md](README.en.md)。
 
-## Status
+## 支持状态
 
-| Feature | State |
+| 功能 | 状态 |
 |---|---|
-| Probe, firmware load, MSI interrupts | ✅ |
-| Scan (2.4 GHz + 5 GHz) | ✅ |
-| WPA2-PSK (CCMP) association, 4-way handshake | ✅ |
-| Hardware RX decryption (software fallback for anything the chip misses) | ✅ |
-| Switching between networks / bands | ✅ |
-| 802.11n (HT20/HT40, MCS 0–15, SGI, RX STBC, WMM) | ✅ |
-| 802.11ac (VHT20/40/80, 2×2 MCS 0–9, RX STBC) | ✅ |
-| 802.11ac VHT160 (MT7922) | ⚠️ experimental (`-mtk160`), opt-in |
-| A-MPDU: RX Block Ack + TX aggregation | ✅ |
-| Hardware TX A-MSDU (inside A-MPDU), VHT beamformee | ✅ |
-| Auto-join at boot, 5 GHz preferred over 2.4 GHz of the same router | ✅ |
-| AUTH / ASSOC retransmission (lost frames no longer cost a full rescan) | ✅ |
-| Auto-recovery of a wedged chip (DMA stall watchdog, PCIe FLR at attach) | ✅ |
-| Native macOS Wi-Fi menu (IO80211Family / Skywalk), Tahoe | ✅ `AirportMtkWlan` |
-| Native Wi-Fi menu, Sequoia 15.2+ | ⚠️ builds, not tested on hardware with this HAL |
-| 802.11ax (HE, MT7922) | ⚠️ experimental (`-mtkhe`), opt-in |
-| WPA3-only (SAE) networks | ❌ |
-| Sleep / wake (firmware reloaded on wake, reconnects by itself) | ✅ |
-| AirDrop / Handoff / Continuity (AWDL) | ❌ |
+| 探测、固件加载、MSI 中断 | ✅ |
+| 扫描（2.4 GHz + 5 GHz） | ✅ |
+| WPA2-PSK（CCMP）关联、四次握手 | ✅ |
+| 硬件 RX 解密（芯片没解出来的走软件兜底） | ✅ |
+| 网络 / 频段切换 | ✅ |
+| 802.11n（HT20/HT40，MCS 0–15，SGI，RX STBC，WMM） | ✅ |
+| 802.11ac（VHT20/40/80，2×2 MCS 0–9，RX STBC） | ✅ |
+| 802.11ac VHT160（MT7922） | ⚠️ 实验性（`-mtk160`），需手动开启 |
+| A-MPDU：RX Block Ack + TX 聚合 | ✅ |
+| 硬件 TX A-MSDU（封装在 A-MPDU 内）、VHT beamformee | ✅ |
+| 开机自动连接，同一路由器优先 5 GHz 而非 2.4 GHz | ✅ |
+| AUTH / ASSOC 重传（丢帧不再导致整轮重新扫描） | ✅ |
+| 芯片卡死自动恢复（DMA 停滞看门狗、attach 时 PCIe FLR） | ✅ |
+| macOS 原生 Wi-Fi 菜单（IO80211Family / Skywalk），Tahoe | ✅ `AirportMtkWlan` |
+| 原生 Wi-Fi 菜单，Sequoia 15.2+ | ⚠️ 能编译，尚未在本 HAL 的实机上验证 |
+| 802.11ax（HE，MT7922） | ⚠️ 实验性（`-mtkhe`），需手动开启 |
+| 仅 WPA3（SAE）的网络 | ❌ |
+| 睡眠 / 唤醒（唤醒后重载固件，自动重连） | ✅ |
+| AirDrop / Handoff / 接力（AWDL） | ❌ |
 
-### Tested hardware
+### 已测试硬件
 
-| Card | PCI ID | macOS | Result |
+| 网卡 | PCI ID | macOS | 结果 |
 |---|---|---|---|
-| MediaTek MT7921K (AMD RZ608) | `14c3:0608` | 26.7.1 Tahoe, Intel desktop | `AirportMtkWlan`: native Wi-Fi menu, joins from Keychain, 50+ Mbit/s on 5 GHz VHT80 (weak signal, 100 Mbit/s line) |
-| MediaTek MT7921K (AMD RZ608) | `14c3:0608` | 15.8.1 Sequoia, Intel desktop | `SimpleMtkWlan`: 30–50 Mbit/s on 5 GHz VHT80 (a MacBook in the same spot gets ~85); 2.4 GHz works; joins automatically at boot |
-| MediaTek MT7922 (RZ616) | `14c3:0616` | 15.6 / 26.7.1 Tahoe | PCIe attach and MT7922 firmware selection verified; Tahoe native Wi-Fi, WPA2, VHT160/HE160 2-NSS, about 460–500 Mbit/s in the local HTTPS test |
-| MediaTek MT7922 | `14c3:7922` | Tahoe (upstream PR #5) | legacy 20 MHz on 5 GHz |
-| MediaTek MT7921 | `14c3:7961` | **26.7.2 Tahoe**, Acer Nitro 5 (i7-11800H) | `AirportMtkWlan` 1.6.0 + `-mtkrxamsdu`: native Wi-Fi menu, **507–589 Mbit/s** on 5 GHz VHT80 at 867 Mbit/s PHY — see [field report](#field-report-mt7921-14c37961-on-tahoe) |
+| MediaTek MT7921K（AMD RZ608） | `14c3:0608` | 26.7.1 Tahoe，Intel 台式机 | `AirportMtkWlan`：原生 Wi-Fi 菜单，可从钥匙串连接，5 GHz VHT80 下 50+ Mbit/s（信号较弱，百兆线路） |
+| MediaTek MT7921K（AMD RZ608） | `14c3:0608` | 15.8.1 Sequoia，Intel 台式机 | `SimpleMtkWlan`：5 GHz VHT80 下 30–50 Mbit/s（同位置 MacBook 约 85）；2.4 GHz 可用；开机自动连接 |
+| MediaTek MT7922（RZ616） | `14c3:0616` | 15.6 / 26.7.1 Tahoe | PCIe attach 与 MT7922 固件选择已验证；Tahoe 原生 Wi-Fi、WPA2、VHT160/HE160 2-NSS，本地 HTTPS 测试约 460–500 Mbit/s |
+| MediaTek MT7922 | `14c3:7922` | Tahoe（上游 PR #5） | 5 GHz 下 20 MHz legacy |
+| MediaTek MT7921 | `14c3:7961` | **26.7.2 Tahoe**，Acer Nitro 5（i7-11800H） | `AirportMtkWlan` 1.6.0 + `-mtkrxamsdu`：原生 Wi-Fi 菜单，PHY 867 Mbit/s、5 GHz VHT80 下 **507–589 Mbit/s** —— 见 [实测记录](#实测记录mt7921-在-tahoe-上) |
 
-Other MediaTek devices are not supported.
+其他 MediaTek 设备不受支持。
 
-### Field report: MT7921 (`14c3:7961`) on Tahoe
+### 实测记录：MT7921 在 Tahoe 上
 
-`14c3:7961` used to be listed as "same chip family as RZ608, expected to work",
-but untested. It works, and it is fast — reproduced on a laptop, with the stock
-v1.6.0 Tahoe build and no source changes.
-
-| Item | Value |
-|---|---|
-| Machine | Acer Nitro 5, Intel i7-11800H, 32 GB |
-| OS | macOS 26.7.2 (25G332), Darwin 25.6.0 |
-| Bootloader | OpenCore REL-108, SIP Custom, AMFI off |
-| Driver | `AirportMtkWlan-Tahoe-1.6.0-RELEASE.zip` (sha256 `599c95df…13fb1`) |
-| boot-args | only `-mtkrxamsdu` added |
-| Link | 802.11ac, 5 GHz ch40, 80 MHz, 2×2 MCS9, SGI, LDPC, 867 Mbit/s, RSSI −31 dBm, WPA2-PSK |
-
-**Throughput** — iperf3 against a wired gigabit host, 10 s, 4 streams unless noted:
-
-| Test | Run 1 | Run 2 |
-|---|---|---|
-| TCP ↑ 4 streams | 514 / 507 Mbit/s | 424 / 415 |
-| TCP ↓ 4 streams | 576 / 565 | 589 / 574 |
-| TCP ↑ single stream | 426 | — |
-| TCP ↓ single stream | 578 | — |
-| UDP ↑ (600 Mbit/s offered) | 534 (1.6 % loss) | — |
-| UDP ↓ (600 Mbit/s offered) | 589 | — |
-
-That is 58–68 % of the 867 Mbit/s PHY rate, i.e. a healthy half-duplex ceiling.
-
-**Driver log** (`tools/mtklog.sh`, unmodified):
-
-```
-rxamsdu: enabled=1 started=32984 completed=32984 subframes=105167 singleton=0
-rxrate:  n=3641 vht=3641 bw80=3641 nss2=3641 mcs9=3641 sgi=3641 ldpc=3641
-tx:      txwi_free=2045 ring_free=2047 full=0 tx_ba=2 amsdu=1
-stats:   ipkts=688375 ierr=0 opkts=789138 oerr=0 ba_below=103
-```
-
-`singleton=0` with ~3.2 subframes per aggregate confirms RX A-MSDU decapsulation
-is doing real work, and `full=0` shows the TX ring is no longer the bottleneck.
-
-#### Two things that cost us days (check these first)
-
-1. **A leftover OCLP "Modern Wireless" / IO80211 root patch from a previous
-   Intel card silently kills the scan list.** The kext attaches, publishes scan
-   results, `postMessage` returns 0 — and the Wi-Fi menu stays empty, because
-   the old IO80211 consumer does not understand Tahoe's WCL messages.
-   `airportd` logs `SCAN_CACHE_UPDATED` with `results=0 liveCount=0 error=-3905`.
-   Remove the root patch *before* debugging the driver; in our case that alone
-   turned "list is always empty" into a working connection.
-2. **`CFBundleVersion` must be plain digits.** Repacking the kext as
-   `1.5.0-myfix` makes OpenCore reject it at prelink time
-   (`Prelinked injection ... - Invalid Parameter`) and the kernel never sees it.
-
-Known minor issues on this machine, none of which affect throughput:
-`networksetup -getairportnetwork en1` reports "not associated" while actually
-connected; scan requests carry 2.4 GHz channels only (`channels=14 2g=14 5g=0`),
-although 5 GHz networks can still be joined from the menu.
-
-Longer bilingual write-up (Chinese + English, including the dead ends we ruled
-out): [laobamac/SimpleMtkWlan#9 comment](https://github.com/laobamac/SimpleMtkWlan/issues/9#issuecomment-6681009999).
-
-<details open>
-<summary><b>中文版实测记录</b></summary>
-
-#### MT7921（`14c3:7961`）在 Tahoe 上的实测
-
-`14c3:7961` 之前只写着「和 RZ608 同族，预期可用」，从未实测。**它能用，而且很快** ——
+`14c3:7961` 之前只被标注为「与 RZ608 同族，预期可用」，从未实测。**它可以用，而且很快** ——
 下面是在笔记本上、用官方 v1.6.0 Tahoe 预编译包、未改一行源码复现的结果。
 
 | 项目 | 值 |
 |---|---|
 | 机器 | Acer Nitro 5，Intel i7-11800H，32 GB |
 | 系统 | macOS 26.7.2 (25G332)，Darwin 25.6.0 |
-| 引导 | OpenCore REL-108，SIP Custom，AMFI 关 |
+| 引导 | OpenCore REL-108，SIP Custom，AMFI 已关 |
 | 驱动 | `AirportMtkWlan-Tahoe-1.6.0-RELEASE.zip`（sha256 `599c95df…13fb1`） |
-| 启动参数 | 仅在原有基础上增加 `-mtkrxamsdu` |
+| 启动参数 | 仅在原有基础上追加 `-mtkrxamsdu` |
 | 链路 | 802.11ac，5 GHz ch40，80 MHz，2×2 MCS9，SGI，LDPC，867 Mbit/s，RSSI −31 dBm，WPA2-PSK |
 
 **吞吐**（iperf3 对有线千兆主机，10 秒，除注明外均为 4 流）：
@@ -162,8 +95,8 @@ out): [laobamac/SimpleMtkWlan#9 comment](https://github.com/laobamac/SimpleMtkWl
 | TCP 下行 4 流 | 576 / 565 | 589 / 574 |
 | TCP 上行 单流 | 426 | — |
 | TCP 下行 单流 | 578 | — |
-| UDP 上行（发 600 Mbit/s） | 534（丢包 1.6%） | — |
-| UDP 下行（发 600 Mbit/s） | 589 | — |
+| UDP 上行（发送端给到 600 Mbit/s） | 534（丢包 1.6%） | — |
+| UDP 下行（发送端给到 600 Mbit/s） | 589 | — |
 
 达到 867 Mbit/s 物理速率的 58–68%，属于健康的半双工上限。
 
@@ -179,7 +112,7 @@ stats:   ipkts=688375 ierr=0 opkts=789138 oerr=0 ba_below=103
 `singleton=0` 且平均每个聚合 3.2 个子帧，说明 RX A-MSDU 解封装确实在工作；
 `full=0` 说明 TX 环已经不再是瓶颈。
 
-##### 让我们多花好几天的两个坑（建议先查这两条）
+#### 让我们多花好几天的两个坑（建议先查这两条）
 
 1. **上一张 Intel 卡留下的 OCLP「Modern Wireless」/ IO80211 root patch 会静默地毁掉扫描列表。**
    驱动能 attach、能发布扫描结果、`postMessage` 返回 0，但 Wi-Fi 菜单始终是空的 ——
@@ -196,42 +129,35 @@ stats:   ipkts=688375 ierr=0 opkts=789138 oerr=0 ba_below=103
 更长的中英双语记录（含被证伪的若干假设）：
 [laobamac/SimpleMtkWlan#9 评论](https://github.com/laobamac/SimpleMtkWlan/issues/9#issuecomment-6681009999)。
 
-</details>
+## 安装
 
-## Installation
+`AirportMtkWlan.kext` 与 `SimpleMtkWlan.kext` **只能二选一**，绝不要同时启用：
+它们匹配的是同一张卡。
 
-Use **either** `AirportMtkWlan.kext` **or** `SimpleMtkWlan.kext`, never both:
-they match the same card.
+### 原生 Wi-Fi 菜单（AirportMtkWlan，Tahoe）
 
-### Native Wi-Fi menu (AirportMtkWlan, Tahoe)
+1. 从 [Releases](https://github.com/e5u/SimpleMtkWlan/releases) 下载
+   `AirportMtkWlan-Tahoe-x.y.z-RELEASE.zip`（macOS 15.2+ 用 `-Sequoia-` 那个）。
+2. 把 `AirportMtkWlan.kext` 复制到 `EFI/OC/Kexts/`，并加入
+   `Kernel → Add`（条目写法与下文相同，`BundlePath` 填 `AirportMtkWlan.kext`，
+   `ExecutablePath` 填 `Contents/MacOS/AirportMtkWlan`）。Tahoe 版设 `MinKernel`
+   `25.0.0` / `MaxKernel` `25.99.99`（Sequoia 用 `24.2.0` / `24.99.99`）：
+   每个构建只适配对应的 IO80211 版本，装错会在另一个版本上 panic。
+3. `Kernel → Quirks → DisableIoMapper` = `true`（驱动目前还不支持 AppleVTD DMA 重映射）。
+4. **不要**打 OCLP 的「Modern Wireless」root patch，也**不要** Block 或替换
+   `IOSkywalkFamily`、**不要**注入 `IO80211FamilyLegacy`：这个 kext 用的是系统自带的
+   Wi-Fi 栈。请把 Intel / 博通教程留下的这类残留清理掉。
+5. 如果装过 `SimpleMtkWlan.kext`，请禁用，并退出 / 删除 SimpleMTK App。
+6. 确认网卡没有被隐藏（见下文第 4 步），重启，然后在 Wi-Fi 菜单里选网络。
 
-1. Download `AirportMtkWlan-Tahoe-x.y.z-RELEASE.zip` (or `-Sequoia-` for macOS
-   15.2+) from [Releases](https://github.com/e5u/SimpleMtkWlan/releases).
-2. Copy `AirportMtkWlan.kext` to `EFI/OC/Kexts/` and add it to
-   `Kernel → Add` (same entry as below, `BundlePath` `AirportMtkWlan.kext`,
-   `ExecutablePath` `Contents/MacOS/AirportMtkWlan`). Set `MinKernel`
-   `25.0.0` / `MaxKernel` `25.99.99` for the Tahoe build (`24.2.0` /
-   `24.99.99` for Sequoia): each build only fits that IO80211 version and
-   would panic on the other.
-3. `Kernel → Quirks → DisableIoMapper` = `true` (the driver does not support
-   AppleVTD DMA remapping yet).
-4. **Do not** apply OCLP "Modern Wireless" root patches and **do not** block
-   or replace `IOSkywalkFamily` / inject `IO80211FamilyLegacy`: this kext uses
-   the system's own Wi-Fi stack. Remove such leftovers from Intel/Broadcom
-   guides.
-5. Disable `SimpleMtkWlan.kext` if present and quit / remove the SimpleMTK app.
-6. Make sure the card is not hidden (step 4 below), reboot and pick a network
-   in the Wi-Fi menu.
+`-mtkhe` 会在 MT7922 上启用 802.11ax 的关联与数据通路。它属于实验性功能，默认关闭。
 
-`-mtkhe` enables 802.11ax association and data paths on MT7922. It is
-experimental and disabled by default.
+### SimpleMtkWlan + SimpleMTK 客户端
 
-### SimpleMtkWlan + SimpleMTK app
-
-1. Download the latest `SimpleMtkWlan-x.y.z-RELEASE.zip` from
-   [Releases](https://github.com/e5u/SimpleMtkWlan/releases) (or build it yourself, see below).
-2. Copy `SimpleMtkWlan.kext` to `EFI/OC/Kexts/`.
-3. Add it to `config.plist → Kernel → Add`:
+1. 从 [Releases](https://github.com/e5u/SimpleMtkWlan/releases) 下载最新的
+   `SimpleMtkWlan-x.y.z-RELEASE.zip`（也可以自行编译，见下文）。
+2. 把 `SimpleMtkWlan.kext` 复制到 `EFI/OC/Kexts/`。
+3. 加入 `config.plist → Kernel → Add`：
 
    ```xml
    <dict>
@@ -246,68 +172,56 @@ experimental and disabled by default.
    </dict>
    ```
 
-4. **Make sure the card is not hidden.** Many prebuilt EFIs ship an SSDT
-   (e.g. `SSDT-Disable_Network_*.aml`) that replaces the card's `vendor-id` /
-   `device-id` with `0xFFFF` so macOS ignores it. Disable it, otherwise the
-   driver never matches. `ioreg -l | grep -A40 'pci14c3'` should show
-   `vendor-id = <c3140000>`.
-5. Install [SimpleMTK](https://github.com/laobamac/SimpleMTKClient), reboot and
-   join a network from the menu bar.
+4. **确认网卡没有被隐藏。** 很多现成 EFI 会带一个 SSDT
+   （例如 `SSDT-Disable_Network_*.aml`），把网卡的 `vendor-id` / `device-id`
+   改写成 `0xFFFF`，让 macOS 忽略它。请禁用该 SSDT，否则驱动永远匹配不上。
+   `ioreg -l | grep -A40 'pci14c3'` 应当能看到 `vendor-id = <c3140000>`。
+5. 安装 [SimpleMTK](https://github.com/laobamac/SimpleMTKClient)，重启，然后在菜单栏里连接网络。
 
-Optional boot-args:
+可选启动参数：
 
-* `-mtkhe` — experimental 802.11ax on MT7922.
-* `-mtk160` — experimental 160 MHz operation on MT7922.
-* `-mtkrxamsdu` — enable RX A-MSDU decapsulation.
-* `-mtknoamsdu` — disable hardware TX A-MSDU.
-* `-mtkno160`, `-mtknopool`, `-mtknowtblba`, `-novht`, `-noht40` — targeted
-  diagnostic fallbacks.
+* `-mtkhe` —— 在 MT7922 上启用实验性 802.11ax。
+* `-mtk160` —— 在 MT7922 上启用实验性 160 MHz。
+* `-mtkrxamsdu` —— 启用 RX A-MSDU 解封装。
+* `-mtknoamsdu` —— 关闭硬件 TX A-MSDU。
+* `-mtkno160`、`-mtknopool`、`-mtknowtblba`、`-novht`、`-noht40` —— 针对性的诊断回退开关。
 
-## Troubleshooting
+## 排错
 
-* **Read the driver log.** The driver keeps a persistent ring buffer that
-  survives a failed start and is readable without root:
+* **先看驱动日志。** 驱动维护一个持久环形缓冲，即使启动失败也依然存在，且无需 root 即可读取：
 
   ```sh
   ./tools/mtklog.sh > mtk.txt
   ```
 
-  A periodic `stats` line shows RX counters, hardware vs software decryption
-  (`rx_hwdec` / `rx_swdec`) and the reasons frames are dropped. Both kexts
-  write the same log.
-* **No Wi-Fi in the menu with AirportMtkWlan.** Check that only one of the
-  two kexts is enabled, that no OCLP wireless patch / `IOSkywalkFamily` block
-  is active, that `DisableIoMapper` is on and that the build matches your
-  macOS (Tahoe vs Sequoia). `ioreg -l -w0 | grep IO80211InterfaceRole` should
-  print `Infrastructure`. A leftover OCLP `IO80211Family` root patch keeps the
-  list empty even though the driver publishes results — see the
-  [field report](#field-report-mt7921-14c37961-on-tahoe).
-* **"SimpleMtkWlan is not running" after a reboot.** A warm reboot does not
-  power-cycle an M.2 card. The driver now recovers the chip automatically
-  (WFSYS reset, then PCIe function-level reset); if it still fails, shut the
-  machine down completely and power it on again.
-* **Slow speed.** Check `rx_swdec` in the stats line: it should stay small
-  compared to `rx_hwdec`. Speed tests are only meaningful with the SimpleMTK
-  menu closed (the client triggers scans; they are throttled to one per two
-  minutes while connected).
-* **A 2.4 GHz wireless mouse/keyboard stutters while Wi-Fi is on 2.4 GHz.**
-  That is RF coexistence in the same band, not a driver bug: keep the card on
-  5 GHz (leave only the 5 GHz network in SimpleMTK) or move the dongle away
-  from the antennas with a USB extension.
-* **Slow to connect after boot.** The network is chosen by the SimpleMTK app,
-  which only starts after login; the driver scans until then.
-* **Throughput below a real Mac.** On weak signal the AP mostly sends VHT
-  MCS 3–4 (see the `rxrate` line). Block Ack Request frames are not delivered
-  by the firmware, so the rare reorder gaps close by a 100 ms timeout
-  (`ba gap_timeout`).
-* Unrelated kernel panics (`element modified after free` at ~2 s of uptime)
-  were caused by `NVMeFix.kext` on the test machine, not by this driver.
+  周期性的 `stats` 行会显示 RX 计数、硬件解密与软件解密的对比
+  （`rx_hwdec` / `rx_swdec`）以及丢帧原因。两个 kext 写的是同一份日志。
+* **AirportMtkWlan 下菜单里没有 Wi-Fi。** 检查是否只启用了两个 kext 中的一个、
+  没有 OCLP 无线补丁 / `IOSkywalkFamily` block 生效、`DisableIoMapper` 已开启、
+  构建版本与系统匹配（Tahoe 还是 Sequoia）。`ioreg -l -w0 | grep IO80211InterfaceRole`
+  应当输出 `Infrastructure`。遗留的 OCLP `IO80211Family` root patch 会让列表为空，
+  即使驱动正常发布了结果 —— 见 [实测记录](#实测记录mt7921-在-tahoe-上)。
+* **重启后提示 "SimpleMtkWlan is not running"。** 热重启不会给 M.2 网卡断电。
+  驱动现在会自动恢复芯片（WFSYS reset，必要时再做 PCIe function-level reset）；
+  如果仍然失败，请彻底关机再开机。
+* **速度慢。** 看 stats 行里的 `rx_swdec`，它应当远小于 `rx_hwdec`。
+  测速只在 SimpleMTK 菜单关闭时才有意义（客户端会触发扫描；已连接时扫描被限制为两分钟一次）。
+* **Wi-Fi 工作在 2.4 GHz 时，2.4 GHz 无线鼠标/键盘卡顿。** 这是同频段的射频共存问题，
+  不是驱动 bug：把网卡固定在 5 GHz（SimpleMTK 里只保留 5 GHz 网络），
+  或者用 USB 延长线把接收器挪离天线。
+* **开机后连接很慢。** 网络由 SimpleMTK App 选择，而它要登录之后才启动；
+  在那之前驱动一直在扫描。
+* **吞吐不如真 Mac。** 信号弱时 AP 大多发 VHT MCS 3–4（看 `rxrate` 行）。
+  固件不投递 Block Ack Request 帧，所以偶尔出现的重排空洞只能靠 100 ms 超时关闭
+  （`ba gap_timeout`）。
+* 无关的内核 panic（启动约 2 秒时 `element modified after free`）在测试机上由
+  `NVMeFix.kext` 引起，不是本驱动的问题。
 
-## Building
+## 编译
 
-Requirements: macOS with Xcode (command line tools are not enough). The kernel
-headers come from [acidanthera/MacKernelSDK](https://github.com/acidanthera/MacKernelSDK),
-which is a git submodule.
+需要装了 Xcode 的 macOS（仅有命令行工具不够）。内核头文件来自
+[acidanthera/MacKernelSDK](https://github.com/acidanthera/MacKernelSDK)，
+它是一个 git submodule。
 
 ```sh
 git clone --recurse-submodules https://github.com/e5u/SimpleMtkWlan.git
@@ -317,129 +231,115 @@ xcodebuild -project SimpleMtkWlan.xcodeproj -scheme SimpleMtkWlan \
 # -> build/Build/Products/Release/SimpleMtkWlan.kext
 ```
 
-Already cloned without submodules? `git submodule update --init`.
+克隆时忘了 submodule？`git submodule update --init`。
 
-> **Do a clean build (`rm -rf build`) after editing headers in `mtk80211/` or
-> `include/`.** They are on the system header search path, which Xcode does
-> not track for dependencies, so stale objects would otherwise be linked.
+> **改动 `mtk80211/` 或 `include/` 下的头文件后，请做一次干净构建（`rm -rf build`）。**
+> 这两个目录在系统头文件搜索路径上，Xcode 不会跟踪它们的依赖关系，
+> 否则会链接到过期的目标文件。
 
-The native Wi-Fi kext is built with a script (not part of the Xcode project):
+原生 Wi-Fi kext 用脚本构建（不在 Xcode 工程里）：
 
 ```sh
-./build-macos.sh Release AirportMtkWlan                        # Tahoe (default)
+./build-macos.sh Release AirportMtkWlan                        # Tahoe（默认）
 AIRPORT_OS=sequoia ./build-macos.sh Release AirportMtkWlan     # Sequoia 15.2+
 # -> build/Release/{tahoe,sequoia}/AirportMtkWlan.kext
 ```
 
-Host tests (extract real driver functions and run them against stubs with
-UBSan by default; CI can enable ASan as well):
+Host 测试（把真实驱动函数抽出来跑桩代码，默认开 UBSan；CI 还可以额外开 ASan）：
 
 ```sh
 ./tests/run-all.sh
 ```
 
-CI builds Debug and Release on every push and pull request; pushing a tag
-`vX.Y.Z` publishes a GitHub release with the zipped kexts.
+CI 在每次 push 和 pull request 上构建 Debug 与 Release；推送 `vX.Y.Z`
+标签会发布一个带 zip 的 GitHub release。
 
-## Repository layout
+## 仓库结构
 
-| Path | Contents |
+| 路径 | 内容 |
 |---|---|
-| `SimpleMtkWlan/SimpleMtkWlan.cpp` | IOEthernetController front end (SimpleMtkWlan.kext), watchdog |
-| `AirportMtkWlan/` | IO80211 / Skywalk front end (AirportMtkWlan.kext), from AirportItlwm (WCL) |
-| `include/Airport/` | IO80211Family / Skywalk headers (`macOS15`, `macOS26` ABI sets) |
-| `SimpleMtkWlan/MtkLog.cpp` | persistent debug log shared by both kexts |
-| `build-macos.sh` | builds AirportMtkWlan (and SimpleMtkWlan) without Xcode project changes |
-| `SimpleMtkWlan/MtkWlanUserClient.cpp` | IOUserClient used by the SimpleMTK app |
-| `SimpleMtkWlan/hal_mwx/` | MT7921/MT7922 hardware layer (port of OpenBSD `mwx`) |
-| `mtk80211/` | `net80211` and BSD/Linux compatibility layer |
-| `include/` | HAL interfaces, embedded firmware (`FwBinary.cpp`), client API |
-| `tests/` | host tests |
-| `tools/mtklog.sh` | dumps the driver log |
-| `MacKernelSDK/` | submodule with kernel headers |
+| `SimpleMtkWlan/SimpleMtkWlan.cpp` | IOEthernetController 前端（SimpleMtkWlan.kext）、看门狗 |
+| `AirportMtkWlan/` | IO80211 / Skywalk 前端（AirportMtkWlan.kext），来自 AirportItlwm（WCL） |
+| `include/Airport/` | IO80211Family / Skywalk 头文件（`macOS15`、`macOS26` 两套 ABI） |
+| `SimpleMtkWlan/MtkLog.cpp` | 两个 kext 共用的持久调试日志 |
+| `build-macos.sh` | 不改 Xcode 工程即可构建 AirportMtkWlan（以及 SimpleMtkWlan） |
+| `SimpleMtkWlan/MtkWlanUserClient.cpp` | SimpleMTK App 使用的 IOUserClient |
+| `SimpleMtkWlan/hal_mwx/` | MT7921/MT7922 硬件层（OpenBSD `mwx` 的移植） |
+| `mtk80211/` | `net80211` 与 BSD/Linux 兼容层 |
+| `include/` | HAL 接口、内嵌固件（`FwBinary.cpp`）、客户端 API |
+| `tests/` | host 测试 |
+| `tools/mtklog.sh` | 导出驱动日志 |
+| `MacKernelSDK/` | 内核头文件子模块 |
 
-## What changed in this fork
+## 本 fork 改了什么
 
-On top of upstream and [PR #5](https://github.com/laobamac/SimpleMtkWlan/pull/5)
-(association context, TX serialization, packet ownership):
+在上游与 [PR #5](https://github.com/laobamac/SimpleMtkWlan/pull/5)
+（关联上下文、TX 串行化、数据包归属）之上：
 
-* **Firmware load:** firmware chunks no longer need 16 KB jumbo mbuf clusters
-  (they were unavailable at boot → `ENOMEM`, no MAC address, no interface).
-* **Interrupts:** register the real MSI vector instead of INTx and stop setting
-  the MSI enable bit by hand (the device stopped raising INTx and only got
-  serviced through a shared line); drain pending status before re-enabling.
-* **TX DMA stall:** multi-mbuf frames are linearized into one cluster; the
-  WFDMA stalled forever on the first DHCP frame.
-* **Group traffic:** the chip does not decrypt group-addressed frames, so
-  broadcast ARP/DHCP was dropped. Keys are now also set up for `net80211`
-  software CCMP as a fallback.
-* **Network switching:** send the deauth to the old AP on its channel before
-  switching, ignore stale disassoc frames while authenticating, and remove the
-  peer station / disable the BSS in firmware when leaving (otherwise hardware
-  decryption stopped after the first switch).
-* **Roaming:** RSSI-triggered background roaming is disabled (it hopped between
-  2.4 and 5 GHz networks of the same router every few seconds).
-* **Throughput:** background scans while associated are throttled.
-* **802.11n:** HT capabilities, WMM, full peer STA record on association, RX
-  Block Ack and TX A-MPDU sessions passed to the firmware. HT 20/40 is
-  advertised (APs only send 80 MHz to clients that claim 40 MHz support).
-* **802.11ac:** VHT capabilities, STA_REC_VHT, operating width (20/40/80 MHz)
-  taken from the association, RX STBC; per-interval RX rate histogram in the
-  debug log.
-* **Joining:** 5 GHz preferred when within 15 RSSI points of 2.4 GHz, stale
-  peer records and stale scan results cleaned up, deauth before the first
-  AUTH and on stop, AUTH/ASSOC retransmitted up to 3 times (one lost
-  association response used to cost ~20 s).
-* **Robustness:** DMA stall watchdog with hard reset + firmware reload, chip
-  recovery at attach (WFSYS reset → PCIe FLR), TXWI leak fix.
-* **Debuggability:** persistent `MtkDebugLog` ring buffer published on the PCI
-  device, periodic hardware/stats dump, quiet logging on the data path.
-* **Native Wi-Fi menu (AirportMtkWlan):** laobamac's AirportItlwm Tahoe/Sequoia
-  (WCL) front end, as adapted to the MediaTek HAL by pengubow, on top of this
-  fork's MT7921 hardware layer. Changes for this card: Tahoe ABI build, the
-  front end's watchdog drives the HAL housekeeping (stall recovery,
-  AUTH/ASSOC retransmit), no manual MSI enable, shared persistent log, link
-  rate from the measured RX rate, and short scans macOS asks for allowed while
-  connected (full sweeps stay throttled).
-* **TX path:** data frames go to the hardware queue of their access
-  category (everything was on VO), no per-frame TX status events, Block Ack
-  disabled for TIDs without an agreement, output pauses when the TX ring is
-  full instead of dropping packets, hardware A-MSDU inside A-MPDU when the AP
-  allows it. VHT SU/MU beamformee and HT LDPC are advertised (Linux defaults).
-* **Sleep / wake:** the card is powered off in S3. On sleep the driver leaves
-  the network and masks interrupts; on wake it takes the chip back (WFSYS
-  reset / PCIe FLR if needed) and reloads the firmware. Before, the first
-  interrupt after wake read a stale DMA ring and panicked.
-* **MT7922 PCIe / 802.11ax:** recognize the RZ616 PCIe ID (`14c3:0616`),
-  select MT7922 firmware, negotiate HE80/HE160 behind `-mtkhe`, and retain
-  VHT160 as the fallback path behind `-mtk160`.
-* **RX path:** use a low-4 GiB DMA page pool so received frames land directly
-  in mbufs, with the normal MCLGET path retained as fallback.
-* **Interrupt scheduling:** move dispatch to `IOFilterInterruptEventSource`
-  and bound RX rescheduling to one work item per interrupt.
-* **WCL:** honor the system roaming lock and expose TX backpressure counters
-  for native Wi-Fi diagnostics.
-* **Tests and build:** expand host coverage for HE TLVs, DMA pooling,
-  A-MSDU/A-MPDU, scan and roaming; build from a clean clone with CI releases.
+* **固件加载：** 固件分片不再需要 16 KB 的 jumbo mbuf cluster
+  （开机时拿不到 → `ENOMEM`，没有 MAC 地址，也没有接口）。
+* **中断：** 注册真正的 MSI 向量而不是 INTx，并且不再手工置 MSI 使能位
+  （设备不再拉 INTx，只能通过共享中断线被服务）；重新使能前先排空挂起的状态。
+* **TX DMA 停滞：** 多 mbuf 的帧被线性化进一个 cluster；此前 WFDMA 在第一个
+  DHCP 帧上就永久卡死。
+* **组播 / 广播流量：** 芯片不解密组地址帧，导致广播 ARP/DHCP 被丢弃。
+  现在同时为 `net80211` 的软件 CCMP 建立密钥，作为兜底。
+* **切换网络：** 切换前先在旧 AP 所在信道上发出 deauth；认证期间忽略过期的
+  disassoc 帧；离开时在固件里删除 peer station / 关闭 BSS
+  （否则第一次切换之后硬件解密就失效了）。
+* **漫游：** 关闭由 RSSI 触发的后台漫游（它会在同一路由器的 2.4 GHz 与 5 GHz
+  网络之间每几秒来回跳）。
+* **吞吐：** 已关联状态下的后台扫描做了限流。
+* **802.11n：** HT 能力、WMM、关联时下发完整的 peer STA record、把 RX Block Ack
+  与 TX A-MPDU 会话交给固件。对外声明 HT 20/40（AP 只会对声称支持 40 MHz 的
+  客户端发 80 MHz）。
+* **802.11ac：** VHT 能力、STA_REC_VHT、工作带宽（20/40/80 MHz）取自关联结果、
+  RX STBC；调试日志里有按周期统计的 RX 速率直方图。
+* **连接过程：** 与 2.4 GHz 的 RSSI 差在 15 点以内时优先选 5 GHz；清理过期的
+  peer 记录和扫描结果；首次 AUTH 之前以及停止时发 deauth；AUTH/ASSOC 最多重传
+  3 次（此前丢一个关联响应就要多等约 20 秒）。
+* **健壮性：** DMA 停滞看门狗（硬复位 + 重载固件）、attach 时的芯片恢复
+  （WFSYS reset → PCIe FLR）、修复 TXWI 泄漏。
+* **可调试性：** 持久的 `MtkDebugLog` 环形缓冲发布在 PCI 设备上，
+  周期性输出硬件 / 统计信息，数据路径上保持安静。
+* **原生 Wi-Fi 菜单（AirportMtkWlan）：** laobamac 的 AirportItlwm Tahoe/Sequoia
+  （WCL）前端，经 pengubow 适配到 MediaTek HAL，再叠在本 fork 的 MT7921 硬件层之上。
+  针对这张卡的改动：Tahoe ABI 构建、由前端看门狗驱动 HAL 的日常维护
+  （停滞恢复、AUTH/ASSOC 重传）、不再手工使能 MSI、共用同一份持久日志、
+  链路速率取自实测 RX 速率、已连接时允许系统请求的短扫描（全量扫描仍然限流）。
+* **TX 路径：** 数据帧进入其接入类别（AC）对应的硬件队列（此前所有帧都排在 VO），
+  去掉逐帧 TX 状态事件，对没有聚合协议的 TID 关闭 Block Ack，TX 环满时暂停输出
+  而不是丢包，AP 允许时在 A-MPDU 内使用硬件 A-MSDU。对外声明 VHT SU/MU
+  beamformee 与 HT LDPC（沿用 Linux 的默认值）。
+* **睡眠 / 唤醒：** S3 时网卡断电。睡眠时驱动离开网络并屏蔽中断；唤醒后重新接管
+  芯片（必要时 WFSYS reset / PCIe FLR）并重载固件。此前唤醒后第一个中断会读到
+  过期的 DMA 环并直接 panic。
+* **MT7922 PCIe / 802.11ax：** 识别 RZ616 的 PCIe ID（`14c3:0616`）、选择 MT7922
+  固件、在 `-mtkhe` 后协商 HE80/HE160，并保留 `-mtk160` 之后的 VHT160 作为回退路径。
+* **RX 路径：** 使用低 4 GiB 的 DMA 页池，让收到的帧直接落进 mbuf，
+  同时保留常规 MCLGET 路径作为兜底。
+* **中断调度：** 分发改到 `IOFilterInterruptEventSource`，
+  并把 RX 重调度限制为每次中断一个工作项。
+* **WCL：** 遵守系统的漫游锁，并暴露 TX 反压计数器供原生 Wi-Fi 诊断使用。
+* **测试与构建：** 扩展 host 测试覆盖 HE TLV、DMA 池、A-MSDU/A-MPDU、扫描与漫游；
+  支持从干净克隆构建，并由 CI 发布。
 
-## License
+## 许可证
 
-GPLv2, see [LICENSE](LICENSE). Some files carry additional or more specific
-notices inherited from upstream GPL/BSD/OpenBSD/NetBSD/FreeBSD components;
-those apply to their respective files. Firmware is redistributed under the
-MediaTek firmware license (as in linux-firmware).
+GPLv2，见 [LICENSE](LICENSE)。部分文件带有从上游 GPL/BSD/OpenBSD/NetBSD/FreeBSD
+组件继承而来的额外或更具体的声明，这些声明分别适用于对应文件。
+固件依 MediaTek 固件许可再分发（与 linux-firmware 一致）。
 
-## Credits
+## 致谢
 
-* [laobamac (王孝慈)](https://github.com/laobamac) — SimpleMtkWlan and SimpleMTK
-* [mavizao](https://github.com/mavizao) — PR #5 (MT7922 association/TX fixes, host tests)
-* [pengubow](https://github.com/pengubow/SimpleMtkWlan) — AirportMtkWlan: AirportItlwm's native Wi-Fi front end on the MediaTek HAL (WCL scan/join hooks, private address, Infrastructure role fix, passphrase joins, command-gate sleep)
-* [laobamac/itlwm](https://github.com/laobamac/itlwm) — AirportItlwm for Sequoia/Tahoe (WCL layer, macOS 15/26 IO80211 headers, TX pull model, link quality)
-* OpenBSD `mwx(4)` driver authors
-* [OpenIntelWireless/itlwm](https://github.com/OpenIntelWireless/itlwm) (zxystd) — net80211 port, driver architecture and the original AirportItlwm
-* Linux [mt76](https://github.com/openwrt/mt76) — hardware reference
-* [acidanthera](https://github.com/acidanthera) — MacKernelSDK
+* [laobamac（王孝慈）](https://github.com/laobamac) —— SimpleMtkWlan 与 SimpleMTK
+* [mavizao](https://github.com/mavizao) —— PR #5（MT7922 关联/TX 修复、host 测试）
+* [pengubow](https://github.com/pengubow/SimpleMtkWlan) —— AirportMtkWlan：把 AirportItlwm 的原生 Wi-Fi 前端接到 MediaTek HAL 上（WCL 扫描/连接钩子、私有地址、Infrastructure 角色修复、密码连接、命令门控睡眠）
+* [laobamac/itlwm](https://github.com/laobamac/itlwm) —— Sequoia/Tahoe 上的 AirportItlwm（WCL 层、macOS 15/26 的 IO80211 头文件、TX pull 模型、链路质量）
+* OpenBSD `mwx(4)` 驱动的作者们
+* [OpenIntelWireless/itlwm](https://github.com/OpenIntelWireless/itlwm)（zxystd）—— net80211 移植、驱动架构与最初的 AirportItlwm
+* Linux [mt76](https://github.com/openwrt/mt76) —— 硬件参考
+* [acidanthera](https://github.com/acidanthera) —— MacKernelSDK
 
-Related: [SimpleMtkBtFw](https://github.com/flxxxxddd/SimpleMtkBtFw) — Bluetooth for MT7921 / RZ608 / MT7922.
-
-See also [CREDITS.md](CREDITS.md).
+相关项目：[SimpleMtkBtFw](https://github.com/flxxxxddd/SimpleMtkBtFw) —— MT7921 / RZ608 / MT7922 的蓝牙。
+另见 [CREDITS.md](CREDITS.md)。
