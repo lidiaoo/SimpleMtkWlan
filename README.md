@@ -37,7 +37,7 @@ hardware layer:
 
 > **In this fork (`lidiaoo/SimpleMtkWlan`):** added a verified field report for
 > `14c3:7961` (MT7921) on macOS 26.7.2 Tahoe with measured throughput and the
-> two pitfalls that cost us days. See
+> two pitfalls that cost us days. English + 中文（可折叠）. See
 > [Field report](#field-report-mt7921-14c37961-on-tahoe).
 
 ## Status
@@ -136,6 +136,67 @@ although 5 GHz networks can still be joined from the menu.
 
 Longer bilingual write-up (Chinese + English, including the dead ends we ruled
 out): [laobamac/SimpleMtkWlan#9 comment](https://github.com/laobamac/SimpleMtkWlan/issues/9#issuecomment-6681009999).
+
+<details>
+<summary><b>中文版实测记录（点此展开 / click to expand）</b></summary>
+
+#### MT7921（`14c3:7961`）在 Tahoe 上的实测
+
+`14c3:7961` 之前只写着「和 RZ608 同族，预期可用」，从未实测。**它能用，而且很快** ——
+下面是在笔记本上、用官方 v1.6.0 Tahoe 预编译包、未改一行源码复现的结果。
+
+| 项目 | 值 |
+|---|---|
+| 机器 | Acer Nitro 5，Intel i7-11800H，32 GB |
+| 系统 | macOS 26.7.2 (25G332)，Darwin 25.6.0 |
+| 引导 | OpenCore REL-108，SIP Custom，AMFI 关 |
+| 驱动 | `AirportMtkWlan-Tahoe-1.6.0-RELEASE.zip`（sha256 `599c95df…13fb1`） |
+| 启动参数 | 仅在原有基础上增加 `-mtkrxamsdu` |
+| 链路 | 802.11ac，5 GHz ch40，80 MHz，2×2 MCS9，SGI，LDPC，867 Mbit/s，RSSI −31 dBm，WPA2-PSK |
+
+**吞吐**（iperf3 对有线千兆主机，10 秒，除注明外均为 4 流）：
+
+| 测试 | 第一次 | 第二次 |
+|---|---|---|
+| TCP 上行 4 流 | 514 / 507 Mbit/s | 424 / 415 |
+| TCP 下行 4 流 | 576 / 565 | 589 / 574 |
+| TCP 上行 单流 | 426 | — |
+| TCP 下行 单流 | 578 | — |
+| UDP 上行（发 600 Mbit/s） | 534（丢包 1.6%） | — |
+| UDP 下行（发 600 Mbit/s） | 589 | — |
+
+达到 867 Mbit/s 物理速率的 58–68%，属于健康的半双工上限。
+
+**驱动日志**（`tools/mtklog.sh` 原样输出）：
+
+```
+rxamsdu: enabled=1 started=32984 completed=32984 subframes=105167 singleton=0
+rxrate:  n=3641 vht=3641 bw80=3641 nss2=3641 mcs9=3641 sgi=3641 ldpc=3641
+tx:      txwi_free=2045 ring_free=2047 full=0 tx_ba=2 amsdu=1
+stats:   ipkts=688375 ierr=0 opkts=789138 oerr=0 ba_below=103
+```
+
+`singleton=0` 且平均每个聚合 3.2 个子帧，说明 RX A-MSDU 解封装确实在工作；
+`full=0` 说明 TX 环已经不再是瓶颈。
+
+##### 让我们多花好几天的两个坑（建议先查这两条）
+
+1. **上一张 Intel 卡留下的 OCLP「Modern Wireless」/ IO80211 root patch 会静默地毁掉扫描列表。**
+   驱动能 attach、能发布扫描结果、`postMessage` 返回 0，但 Wi-Fi 菜单始终是空的 ——
+   因为旧的 IO80211 消费端不认识 Tahoe 的 WCL 消息。
+   `airportd` 日志里是 `SCAN_CACHE_UPDATED` 配 `results=0 liveCount=0 error=-3905`。
+   **请先清掉 root patch，再去调试驱动**；我们这边仅这一步就让「列表永远为空」变成了正常连网。
+2. **`CFBundleVersion` 必须是纯数字。** 把 kext 重新打包成 `1.5.0-myfix` 会让 OpenCore
+   在预链接阶段直接拒绝（`Prelinked injection ... - Invalid Parameter`），内核根本看不到它。
+
+本机还观察到几个不影响吞吐的小问题：
+`networksetup -getairportnetwork en1` 在已连网时仍报 "not associated"；
+扫描请求只带 2.4 GHz 信道（`channels=14 2g=14 5g=0`），但 5 GHz 网络仍可从菜单直接连接。
+
+更长的中英双语记录（含被证伪的若干假设）：
+[laobamac/SimpleMtkWlan#9 评论](https://github.com/laobamac/SimpleMtkWlan/issues/9#issuecomment-6681009999)。
+
+</details>
 
 ## Installation
 
