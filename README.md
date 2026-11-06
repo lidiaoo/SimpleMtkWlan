@@ -35,6 +35,11 @@ hardware layer:
 > (VHT80) and the native Wi-Fi menu on Tahoe. See
 > [What changed in this fork](#what-changed-in-this-fork).
 
+> **In this fork (`lidiaoo/SimpleMtkWlan`):** added a verified field report for
+> `14c3:7961` (MT7921) on macOS 26.7.2 Tahoe with measured throughput and the
+> two pitfalls that cost us days. See
+> [Field report](#field-report-mt7921-14c37961-on-tahoe).
+
 ## Status
 
 | Feature | State |
@@ -67,9 +72,70 @@ hardware layer:
 | MediaTek MT7921K (AMD RZ608) | `14c3:0608` | 15.8.1 Sequoia, Intel desktop | `SimpleMtkWlan`: 30–50 Mbit/s on 5 GHz VHT80 (a MacBook in the same spot gets ~85); 2.4 GHz works; joins automatically at boot |
 | MediaTek MT7922 (RZ616) | `14c3:0616` | 15.6 / 26.7.1 Tahoe | PCIe attach and MT7922 firmware selection verified; Tahoe native Wi-Fi, WPA2, VHT160/HE160 2-NSS, about 460–500 Mbit/s in the local HTTPS test |
 | MediaTek MT7922 | `14c3:7922` | Tahoe (upstream PR #5) | legacy 20 MHz on 5 GHz |
-| MediaTek MT7921 | `14c3:7961` | — | same chip family as RZ608, expected to work |
+| MediaTek MT7921 | `14c3:7961` | **26.7.2 Tahoe**, Acer Nitro 5 (i7-11800H) | `AirportMtkWlan` 1.6.0 + `-mtkrxamsdu`: native Wi-Fi menu, **507–589 Mbit/s** on 5 GHz VHT80 at 867 Mbit/s PHY — see [field report](#field-report-mt7921-14c37961-on-tahoe) |
 
 Other MediaTek devices are not supported.
+
+### Field report: MT7921 (`14c3:7961`) on Tahoe
+
+`14c3:7961` used to be listed as "same chip family as RZ608, expected to work",
+but untested. It works, and it is fast — reproduced on a laptop, with the stock
+v1.6.0 Tahoe build and no source changes.
+
+| Item | Value |
+|---|---|
+| Machine | Acer Nitro 5, Intel i7-11800H, 32 GB |
+| OS | macOS 26.7.2 (25G332), Darwin 25.6.0 |
+| Bootloader | OpenCore REL-108, SIP Custom, AMFI off |
+| Driver | `AirportMtkWlan-Tahoe-1.6.0-RELEASE.zip` (sha256 `599c95df…13fb1`) |
+| boot-args | only `-mtkrxamsdu` added |
+| Link | 802.11ac, 5 GHz ch40, 80 MHz, 2×2 MCS9, SGI, LDPC, 867 Mbit/s, RSSI −31 dBm, WPA2-PSK |
+
+**Throughput** — iperf3 against a wired gigabit host, 10 s, 4 streams unless noted:
+
+| Test | Run 1 | Run 2 |
+|---|---|---|
+| TCP ↑ 4 streams | 514 / 507 Mbit/s | 424 / 415 |
+| TCP ↓ 4 streams | 576 / 565 | 589 / 574 |
+| TCP ↑ single stream | 426 | — |
+| TCP ↓ single stream | 578 | — |
+| UDP ↑ (600 Mbit/s offered) | 534 (1.6 % loss) | — |
+| UDP ↓ (600 Mbit/s offered) | 589 | — |
+
+That is 58–68 % of the 867 Mbit/s PHY rate, i.e. a healthy half-duplex ceiling.
+
+**Driver log** (`tools/mtklog.sh`, unmodified):
+
+```
+rxamsdu: enabled=1 started=32984 completed=32984 subframes=105167 singleton=0
+rxrate:  n=3641 vht=3641 bw80=3641 nss2=3641 mcs9=3641 sgi=3641 ldpc=3641
+tx:      txwi_free=2045 ring_free=2047 full=0 tx_ba=2 amsdu=1
+stats:   ipkts=688375 ierr=0 opkts=789138 oerr=0 ba_below=103
+```
+
+`singleton=0` with ~3.2 subframes per aggregate confirms RX A-MSDU decapsulation
+is doing real work, and `full=0` shows the TX ring is no longer the bottleneck.
+
+#### Two things that cost us days (check these first)
+
+1. **A leftover OCLP "Modern Wireless" / IO80211 root patch from a previous
+   Intel card silently kills the scan list.** The kext attaches, publishes scan
+   results, `postMessage` returns 0 — and the Wi-Fi menu stays empty, because
+   the old IO80211 consumer does not understand Tahoe's WCL messages.
+   `airportd` logs `SCAN_CACHE_UPDATED` with `results=0 liveCount=0 error=-3905`.
+   Remove the root patch *before* debugging the driver; in our case that alone
+   turned "list is always empty" into a working connection.
+2. **`CFBundleVersion` must be plain digits.** Repacking the kext as
+   `1.5.0-myfix` makes OpenCore reject it at prelink time
+   (`Prelinked injection ... - Invalid Parameter`) and the kernel never sees it.
+
+Known minor issues on this machine, none of which affect throughput:
+`networksetup -getairportnetwork en1` reports "not associated" while actually
+connected; scan requests carry 2.4 GHz channels only (`channels=14 2g=14 5g=0`),
+although 5 GHz networks can still be joined from the menu.
+
+Longer bilingual write-up (Chinese + English, including the dead ends we ruled
+out): [laobamac/SimpleMtkWlan#9 comment](https://github.com/laobamac/SimpleMtkWlan/issues/9#issuecomment-6681009999).
 
 ## Installation
 
@@ -152,7 +218,9 @@ Optional boot-args:
   two kexts is enabled, that no OCLP wireless patch / `IOSkywalkFamily` block
   is active, that `DisableIoMapper` is on and that the build matches your
   macOS (Tahoe vs Sequoia). `ioreg -l -w0 | grep IO80211InterfaceRole` should
-  print `Infrastructure`.
+  print `Infrastructure`. A leftover OCLP `IO80211Family` root patch keeps the
+  list empty even though the driver publishes results — see the
+  [field report](#field-report-mt7921-14c37961-on-tahoe).
 * **"SimpleMtkWlan is not running" after a reboot.** A warm reboot does not
   power-cycle an M.2 card. The driver now recovers the chip automatically
   (WFSYS reset, then PCIe function-level reset); if it still fails, shut the
