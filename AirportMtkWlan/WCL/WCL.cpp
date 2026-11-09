@@ -188,7 +188,10 @@ IOReturn AirportItlwmSkywalkInterface::wclCommand(OSObject *, void *a0, void *a1
         case 0: return self->beginWCLScan(static_cast<apple80211ScanRequest *>(a2));
         case 1: return self->beginWCLJoin(static_cast<apple80211AssocCandidates *>(a2));
         case 2: return self->abortWCLJoin();
-        case 3: return self->leaveWCLNetwork();
+        case 3:
+            XYLog("WCL leave: airportd leaveNetwork cmd (state=%d)\n",
+                  self->fHalService->get80211Controller()->ic_state);
+            return self->leaveWCLNetwork();
         case 6: return self->copyWCLExtendedBss(a2);
         case 7:
             if (!a2 || !self->wclBssValid || !self->wclAssociatedBeacons)
@@ -262,13 +265,131 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
     AirportWCL::ScanRequest scan;
     if (!AirportWCL::decodeScan(request, 0x1550, scan))
         return kIOReturnBadArgument;
+    /*
+     * DIAG [scan-5g] (local, not upstream): mt7921_mcu_hw_scan reports
+     * "2g=14 5g=0" even when the adapter runs on a 5 GHz network, so the
+     * "Other networks" list only ever shows 2.4 GHz. The bitmap we hand
+     * to the HAL is built by decodeScan(), which drops entries on three
+     * guessed flag rules. Dump the raw apple80211_channel list for the
+     * first few requests so the real flag encoding can be read off the
+     * machine instead of guessed. Pure logging: no behaviour change.
+     */
+    {
+        static unsigned diagScans;
+
+        if (diagScans < 6 && scan.channelCount) {
+            const uint8_t *raw =
+                reinterpret_cast<const uint8_t *>(request);
+            unsigned kept = 0, drop6g = 0, dropBand = 0, dropRange = 0;
+
+            for (uint32_t i = 0; i < scan.channelCount; ++i) {
+                const uint8_t *entry = raw + 0x58 + size_t(i) * 12;
+                uint32_t channel = AirportWCL::read32(entry + 4);
+                uint32_t flags = AirportWCL::read32(entry + 8);
+
+                if (!channel || channel > 196) {
+                    dropRange++;
+                    continue;
+                }
+                if (flags & 0x2000) {
+                    drop6g++;
+                    continue;
+                }
+                if (((flags & 0x8) && channel > 14) ||
+                    ((flags & 0x10) && channel <= 14)) {
+                    dropBand++;
+                    continue;
+                }
+                kept++;
+            }
+            XYLog("WCL scan diag count=%u type=%u ssidLen=%u kept=%u "
+                "dropRange=%u drop6g=%u dropBand=%u bm=%02x%02x%02x%02x\n",
+                scan.channelCount, scan.type, scan.ssidLength, kept,
+                dropRange, drop6g, dropBand, scan.channels[0],
+                scan.channels[1], scan.channels[4], scan.channels[5]);
+            for (uint32_t i = 0; i < scan.channelCount && i < 24; ++i) {
+                const uint8_t *entry = raw + 0x58 + size_t(i) * 12;
+                XYLog("WCL scan diag ch[%u] channel=%u flags=0x%x\n", i,
+                    AirportWCL::read32(entry + 4),
+                    AirportWCL::read32(entry + 8));
+            }
+            diagScans++;
+        }
+    }
     ieee80211com *ic = fHalService->get80211Controller();
-    if (!(ic->ic_if.if_flags & IFF_RUNNING))
-        return kIOReturnNotReady;
-    if (scanPending || joinPending || (ic->ic_flags & IEEE80211_F_BGSCAN))
-        return kIOReturnBusy;
-    if (ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
-        return kIOReturnBusy;
+    /*
+     * PATCH [local-p7]: a channel walk that gets interrupted by a join (or
+     * by a state change) can end without MCU_EVENT_SCAN_DONE ever arriving.
+     * scanPending then stays latched and every later request is answered
+     * with kIOReturnBusy: airportd reports "scanResultsCount=0" after
+     * ~13 ms and the Wi-Fi menu stays empty until the interface is power
+     * cycled.  Measured on 2026-11-08: after a disconnect/join storm the
+     * driver sat in S_SCAN with scan request 42 / scan done 40 and refused
+     * everything; setairportpower off/on was the only way out.
+     *
+     * So: repair the contradictory states instead of refusing forever, and
+     * log which condition was taken so the ioreg ring shows what latched.
+     * A healthy walk is capped at 12 s (scanSource timeout), so anything
+     * older than 18 s + 4 s of slack is definitely orphaned.
+     */
+    {
+        static uint32_t healLogs, rejectLogs;
+        uint64_t now = airport_up_time();
+
+        if (scanPending && wclScanDeadline != 0 &&
+            now > wclScanDeadline + 4000) {
+            if (healLogs < 24) {
+                XYLog("WCL scan self-heal: orphaned scanPending "
+                    "age=%llums results=%u state=%d idle=%d\n",
+                    now - (wclScanDeadline - 18000), wclScanResults,
+                    ic->ic_state, ic->ic_wcl_scan_idle);
+                healLogs++;
+            }
+            scanPending = false;
+            scanCompleted = false;
+            wclScanResults = 0;
+            scanSource->cancelTimeout();
+            ic->ic_wcl_scan_requested = false;
+        }
+        /* A cache bgscan can only be live while associated; anywhere at or
+         * below S_SCAN the flag is left over from an aborted transition. */
+        if ((ic->ic_flags & IEEE80211_F_BGSCAN) &&
+            ic->ic_state <= IEEE80211_S_SCAN) {
+            if (healLogs < 24) {
+                XYLog("WCL scan self-heal: stale bgscan flag in state %d\n",
+                    ic->ic_state);
+                healLogs++;
+            }
+            ic->ic_flags &= ~IEEE80211_F_BGSCAN;
+        }
+        if (!(ic->ic_if.if_flags & IFF_RUNNING)) {
+            if (rejectLogs < 12) {
+                XYLog("WCL scan reject: ifnet not running state=%d\n",
+                    ic->ic_state);
+                rejectLogs++;
+            }
+            return kIOReturnNotReady;
+        }
+        if (scanPending || joinPending ||
+            (ic->ic_flags & IEEE80211_F_BGSCAN)) {
+            if (rejectLogs < 12) {
+                XYLog("WCL scan reject busy: scanPending=%d joinPending=%d "
+                    "bgscan=%d state=%d idle=%d\n", scanPending, joinPending,
+                    !!(ic->ic_flags & IEEE80211_F_BGSCAN), ic->ic_state,
+                    ic->ic_wcl_scan_idle);
+                rejectLogs++;
+            }
+            return kIOReturnBusy;
+        }
+        if (ic->ic_state == IEEE80211_S_AUTH ||
+            ic->ic_state == IEEE80211_S_ASSOC) {
+            if (rejectLogs < 12) {
+                XYLog("WCL scan reject: authing state=%d\n", ic->ic_state);
+                rejectLogs++;
+            }
+            return kIOReturnBusy;
+        }
+    }
     if (scan.channelCount) {
         bool usable = false;
         for (unsigned channel = 1; channel <= IEEE80211_CHAN_MAX; ++channel)
@@ -280,6 +401,8 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
     }
     scanPending = true;
     scanCompleted = false;
+    wclScanResults = 0;
+    wclScanDeadline = airport_up_time() + 18000;
     scanSkipCompletion = ic->ic_state == IEEE80211_S_SCAN &&
         ((scan.type != 2 && scan.ssidLength != 0) ||
          ic->ic_wcl_scan_ssid_length != 0 || ic->ic_des_esslen != 0);
@@ -289,7 +412,11 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
     memcpy(ic->ic_wcl_scan_ssid, scan.ssid, sizeof(scan.ssid));
     ic->ic_wcl_scan_restricted = scan.channelCount != 0;
     memcpy(ic->ic_wcl_scan_channels, scan.channels, sizeof(scan.channels));
-    scanSource->setTimeoutMS(20000);
+    /*
+     * Hard cap only; the timer is re-armed to a short quiet period every time
+     * a beacon is published, so a normal walk finishes seconds before this.
+     */
+    scanSource->setTimeoutMS(12000);
     if (ic->ic_state == IEEE80211_S_RUN) {
         ieee80211_begin_cache_bgscan(&ic->ic_if);
         if (!(ic->ic_flags & IEEE80211_F_BGSCAN)) {
@@ -319,17 +446,74 @@ void AirportItlwmSkywalkInterface::finishWCLScan(IOReturn status)
 {
     if (!scanPending)
         return;
+    /*
+     * A scan that produced no beacon event still leaves the node tree full of
+     * APs from the channel walk.  Reporting success with zero results makes
+     * airportd replace its cache with an empty set, which is the "list goes
+     * blank for a moment" flicker in the Wi-Fi menu.
+     */
+    if (wclScanResults == 0)
+        publishWCLCachedResults();
     scanPending = false;
     scanCompleted = false;
+    wclScanResults = 0;
     scanSource->cancelTimeout();
     fHalService->get80211Controller()->ic_wcl_scan_requested = false;
     instance->postMessage(this, AirportWCL::ScanDone, &status, sizeof(status), true);
+    /*
+     * PATCH [local-p15]: replay a join that arrived while this walk was
+     * still live.  scanPending is already cleared above, so the replayed
+     * request takes the normal path instead of deferring again.
+     */
+    if (joinDeferred)
+        resumeWCLJoin();
 }
 
 void AirportItlwmSkywalkInterface::completeWCLScan()
 {
-    if (!wclStopping)
-        finishWCLScan(scanCompleted ? kIOReturnSuccess : kIOReturnTimeout);
+    if (wclStopping)
+        return;
+    /*
+     * MT7921 does deliver MCU_EVENT_SCAN_DONE, but it is dropped whenever the
+     * walk is started from a settled S_SCAN/S_RUN state or aborted early by a
+     * join, so this timer is often the only completion.  IO80211 has already
+     * ingested every beacon publishWCLBeacon() handed over, so once the walk
+     * went quiet with something collected, reporting success is accurate.
+     * The old code always reported kIOReturnTimeout in that case, which made
+     * airportd discard the whole cache and redraw an empty list.
+     */
+    finishWCLScan((scanCompleted || wclScanResults) ? kIOReturnSuccess
+                                                    : kIOReturnTimeout);
+}
+
+void AirportItlwmSkywalkInterface::publishWCLCachedResults()
+{
+    ieee80211com *ic = fHalService->get80211Controller();
+    struct ieee80211_node *ni;
+    uint32_t nodes = 0;
+
+    /*
+     * Events only publish beacons that arrive while the scan is running.  A
+     * scan started from a settled S_SCAN state finishes after the driver's
+     * channel walk, so most of the APs sitting in ic_tree never produced a
+     * beacon event during the window; the request then completed with
+     * "success, 0 results" and the UI stayed empty.  Re-serialise the SSID and
+     * RSN IEs from the node (the node keeps parsed state, not the raw frame)
+     * and hand every candidate over before ScanDone.
+     */
+    RB_FOREACH(ni, ieee80211_tree, &ic->ic_tree) {
+        if (nodes >= 96)
+            break;
+        uint8_t ies[256];
+        uint8_t *frm = ies;
+        frm = ieee80211_add_ssid(frm, ni->ni_essid, ni->ni_esslen);
+        if (ni->ni_rsnprotos != 0)
+            frm = ieee80211_add_rsn(frm, ic, ni);
+        publishWCLBeacon(ni, ies, size_t(frm - ies));
+        ++nodes;
+    }
+    XYLog("publishWCLCachedResults nodes=%u published=%u\n", nodes,
+        wclScanResults);
 }
 
 void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, const uint8_t *ies, size_t length)
@@ -367,6 +551,16 @@ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, 
             bzero(wclBssInfo, sizeof(wclBssInfo));
             memcpy(wclBssInfo, metadata, messageSize);
         }
+    }
+    if (scanPending) {
+        ++wclScanResults;
+        /*
+         * Quiet-period completion: the channel walk is done once no new
+         * beacon has arrived for a while.  Bounded by wclScanDeadline so a
+         * busy radio cannot defer the completion forever.
+         */
+        if (airport_up_time() < wclScanDeadline)
+            scanSource->setTimeoutMS(1200);
     }
     instance->postMessage(this, AirportWCL::ScanResult, metadata, messageSize, true);
     IOFree(metadata, size);
@@ -471,14 +665,36 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
         joinTimer->setTimeoutMS(30000);
         return kIOReturnSuccess;
     }
-    if (!supported || !(ic->ic_if.if_flags & IFF_RUNNING) || joinPending || scanPending) {
+    if (!supported || !(ic->ic_if.if_flags & IFF_RUNNING) || joinPending) {
         explicit_bzero(&join, sizeof(join));
         return !supported ? kIOReturnUnsupported : kIOReturnBusy;
     }
-    if (ic->ic_state == IEEE80211_S_RUN || ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
+    /*
+     * PATCH [local-p15]: a live walk is only a few seconds of channel
+     * hopping.  Answering kIOReturnBusy makes airportd drop the request,
+     * issue leaveNetwork and retry - which tears down the link we are about
+     * to build and costs a full join-timeout cycle (16.1 s measured).
+     * Hold the request instead and replay it the moment the walk finishes
+     * (finishWCLScan -> resumeWCLJoin); joinTimer stays armed as the backstop.
+     */
+    if (scanPending) {
+        deferredJoin = join;
+        memcpy(joinBSSID, join.bssid, sizeof(joinBSSID));
+        explicit_bzero(&join, sizeof(join));
+        joinDeferred = joinPending = true;
+        assocNotified = firstBeaconNotified = portAuthorized = false;
+        joinTimer->setTimeoutMS(30000);
+        XYLog("WCL join: deferred behind running scan (state=%d)\n", ic->ic_state);
+        return kIOReturnSuccess;
+    }
+    if (ic->ic_state == IEEE80211_S_RUN || ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC) {
+        XYLog("WCL leave: new join preempts state=%d\n", ic->ic_state);
         leaveWCLNetwork();
+    }
     ieee80211_disable_rsn(ic);
     ieee80211_disable_wep(ic);
+    /* PATCH [local-p18]: pre-join wipe; the new key lands below and clears it */
+    ic->ic_wcl_psk_wiped = true;
     explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
     clearWCLPMKSA();
     ic->ic_flags &= ~(IEEE80211_F_AUTO_JOIN | IEEE80211_F_PSK);
@@ -554,6 +770,8 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     ic->ic_flags |= IEEE80211_F_DESBSSID;
     ic->ic_wcl_join_requested = true;
     ic->ic_wcl_scan_requested = false;
+    /* PATCH [local-p18]: a fresh join supersedes any earlier wipe */
+    ic->ic_wcl_psk_wiped = false;
     current_authtype_lower = join.lowerAuth;
     current_authtype_upper = join.upperAuth;
     explicit_bzero(&join, sizeof(join));
@@ -564,19 +782,74 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
     bzero(wclBeaconInfo, sizeof(wclBeaconInfo));
     disassocIsVoluntary = false;
     joinTimer->setTimeoutMS(30000);
-    if (ic->ic_state == IEEE80211_S_SCAN && ic->ic_wcl_scan_idle) {
-        // The stack waits for us between scans (ieee80211_end_scan).
-        ic->ic_wcl_scan_idle = false;
-        ieee80211_next_scan(&ic->ic_if);
-    }
     if (ic->ic_state != IEEE80211_S_SCAN && ic->ic_newstate(ic, IEEE80211_S_SCAN, -1)) {
         joinPending = false;
         joinTimer->cancelTimeout();
         ic->ic_wcl_join_requested = false;
         clearWCLPMKSA();
         ic->ic_wcl_enterprise = false;
+        /* PATCH [local-p18]: deliberate wipe, keep the zero-PSK log quiet */
+        ic->ic_wcl_psk_wiped = true;
         explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
         return kIOReturnError;
+    }
+    /*
+     * PATCH [local-p15]: airportd hands us a BSSID it just picked out of its
+     * own scan results, so that node is normally already in ic_tree.  Walking
+     * every channel again just to find it costs the whole sweep (measured
+     * 5.4 s for 41 channels) and delays the first AUTH frame by exactly that
+     * much; combined with the 15 s join timeout it produces the bimodal
+     * 1.7 s / 16.1 s distribution seen on 2026-11-09.  Join the cached node
+     * directly and fall back to the walk only when the cache really misses.
+     */
+    {
+        struct ieee80211_node *cached = NULL;
+        if (ic->ic_bss != NULL && ic->ic_des_esslen != 0) {
+            struct ieee80211_node *ni = ieee80211_find_node(ic, joinBSSID);
+            /*
+             * PATCH [local-p17]: an entry can still be linked in ic_tree
+             * after leaveWCLNetwork() cleared its contents, in which case
+             * find_node() hands back a husk with ni_rsnprotos / akms /
+             * ciphers zeroed.  Joining it makes node_join_bss() copy an
+             * empty macaddr into ic_bss, and the AUTH retries then go to
+             * ff:ff:ff:ff:ff:ff for six rounds until the watchdog resets
+             * the state machine (measured 471.890: protos=0 akms=0
+             * ciphers=0, then "AUTH: pre-auth deauth sent to
+             * ff:ff:ff:ff:ff:ff", 20.9 s wasted).  Require a fully
+             * populated RSN node when RSN is on, and hold a reference for
+             * the duration of the join so the tree cannot free it
+             * underneath us.
+             */
+            if (ni != NULL && ni->ni_chan != NULL && ni->ni_rssi != 0 &&
+                (!(ic->ic_flags & IEEE80211_F_RSNON) ||
+                 ni->ni_rsnprotos != 0) &&
+                ni->ni_esslen == ic->ic_des_esslen &&
+                memcmp(ni->ni_essid, ic->ic_des_essid, ni->ni_esslen) == 0)
+                cached = ieee80211_ref_node(ni);
+            else if (ni != NULL)
+                XYLog("WCL join: cached node unusable "
+                      "protos=%d akms=%d ciphers=%d, scan instead\n",
+                      ni->ni_rsnprotos, ni->ni_rsnakms, ni->ni_rsnciphers);
+        }
+        if (cached != NULL) {
+            XYLog("WCL join: cached node hit rssi=%d chan=%d, skip scan\n",
+                  cached->ni_rssi, ieee80211_chan2ieee(ic, cached->ni_chan));
+            /*
+             * We are bypassing ieee80211_end_scan(), which is what normally
+             * clears the scan-in-progress flags.  Left behind they make the
+             * watchdog think a walk is still live.  Dropping F_BGSCAN here is
+             * safe for the same reason the self-heal in beginWCLScan() does it:
+             * a cache scan cannot be meaningful once we are at or below S_SCAN.
+             */
+            ic->ic_wcl_scan_idle = false;
+            ic->ic_flags &= ~(IEEE80211_F_ASCAN | IEEE80211_F_BGSCAN);
+            ieee80211_node_join_bss(ic, cached);
+            ieee80211_free_node(ic, cached);
+        } else if (ic->ic_wcl_scan_idle) {
+            // The stack waits for us between scans (ieee80211_end_scan).
+            ic->ic_wcl_scan_idle = false;
+            ieee80211_next_scan(&ic->ic_if);
+        }
     }
     return kIOReturnSuccess;
 }
@@ -601,6 +874,10 @@ void AirportItlwmSkywalkInterface::finishWCLJoin(uint16_t status, uint16_t reaso
 {
     if (!joinPending)
         return;
+    /* PATCH [local-p11]: caller trace, so a bad round can be attributed */
+    XYLog("WCL join complete status=%u reason=%u driver=%d state=%d\n",
+          status, reason, (int)driverStatus,
+          fHalService->get80211Controller()->ic_state);
     AirportWCL::ConnectionEvent event = {};
     event.status = status;
     event.reason = reason;
@@ -618,7 +895,35 @@ void AirportItlwmSkywalkInterface::finishWCLJoin(uint16_t status, uint16_t reaso
         ic->ic_wcl_join_requested = false;
         clearWCLPMKSA();
         ic->ic_wcl_enterprise = false;
+        /*
+         * PATCH [local-p18]: flag the wipe.  The zero-PSK guard in
+         * ieee80211_input.c cannot tell "we wiped it on purpose" from
+         * "the key vanished and the state machine is still running";
+         * without this bit every failed join produced a second, bogus
+         * "with no PMK ... re-auth cannot succeed" report (measured
+         * 8 bogus reports against 8 failed joins in the 5-round P17
+         * run) and buried the real signal.
+         */
+        ic->ic_wcl_psk_wiped = true;
         explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
+        /*
+         * PATCH [local-p14]: the join is over, so stop the state machine
+         * too.  Wiping ic_psk here while leaving the driver in AUTH or
+         * ASSOC is what produced the "psk check 80" loop: debugPoll kept
+         * re-sending AUTH_REQ / ASSOC_REQ, the AP kept accepting them,
+         * and every 4-way ran on 32 zero bytes.  Parking in S_INIT also
+         * lets beginWCLScan() work again, which is what the reconnect
+         * needs in the first place.
+         */
+        if (ic->ic_state > IEEE80211_S_SCAN) {
+            XYLog("WCL join failed, parking in S_INIT (was state=%d)\n",
+                  ic->ic_state);
+            ieee80211_new_state(ic, IEEE80211_S_INIT, -1);
+        }
+    } else {
+        /* PATCH [local-p18]: the key is live again, so a later zero-PSK
+         * report is a genuine fault and must not be suppressed. */
+        fHalService->get80211Controller()->ic_wcl_psk_wiped = false;
     }
 }
 
@@ -626,6 +931,8 @@ void AirportItlwmSkywalkInterface::wclJoinTimeout(OSObject *owner, IOTimerEventS
 {
     auto self = OSDynamicCast(AirportItlwmSkywalkInterface, owner);
     if (self && !self->wclStopping) {
+        XYLog("WCL leave: join timeout fired (state=%d)\n",
+              self->fHalService->get80211Controller()->ic_state);
         self->finishWCLJoin(1, 1004, kIOReturnTimeout);
         self->leaveWCLNetwork();
     }
@@ -649,6 +956,8 @@ IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
         ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
     ieee80211_disable_rsn(ic);
     ieee80211_disable_wep(ic);
+    /* PATCH [local-p18]: deliberate wipe on leave, not a fault */
+    ic->ic_wcl_psk_wiped = true;
     explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
     clearWCLPMKSA();
     ic->ic_wcl_enterprise = false;
@@ -660,6 +969,8 @@ IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
 
 IOReturn AirportItlwmSkywalkInterface::abortWCLJoin()
 {
+    XYLog("WCL leave: abort join request from airportd (state=%d joinPending=%d)\n",
+          fHalService->get80211Controller()->ic_state, (int)joinPending);
     leaveWCLNetwork();
     instance->postMessage(this, AirportWCL::JoinAbortComplete, nullptr, 0, true);
     return kIOReturnSuccess;

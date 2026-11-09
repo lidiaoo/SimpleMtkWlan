@@ -61,6 +61,18 @@ OSDefineMetaClassAndStructors(MtkMwx, MtkHalService)
 #define NBPFILTER 0
 #endif
 
+/*
+ * [local-p19] ic_wcl_preauth_deauth is an AIRPORT_WCL field, but the state
+ * machine below is compiled for both products.  Without the WCL front-end
+ * there is no pre-auth deauth to echo back, so the arm/disarm collapses to
+ * nothing -- net80211 would then never swallow a real deauth.
+ */
+#ifdef AIRPORT_WCL
+#define MWX_ARM_PREAUTH_DEAUTH(ic, v)	((ic)->ic_wcl_preauth_deauth = (v))
+#else
+#define MWX_ARM_PREAUTH_DEAUTH(ic, v)	((void)(ic), (void)(v))
+#endif
+
 #define PCI_VENDOR_MEDIATEK            0x14c3
 #define PCI_PRODUCT_MEDIATEK_MT7921    0x7961
 #define PCI_PRODUCT_MEDIATEK_MT7921K   0x0608
@@ -1551,7 +1563,7 @@ mwx_start(struct ifnet *ifp)
 	struct ether_header *eh;
 	struct mbuf *m;
 
-	if (!(ifp->if_flags & IFF_RUNNING) || ifq_is_oactive(&ifp->if_snd))
+	if (!(ifp->if_flags & IFF_RUNNING))
 		return;
 
 	for (;;) {
@@ -1571,6 +1583,28 @@ mwx_start(struct ifnet *ifp)
 		if (m) {
 			ni = (struct ieee80211_node *)mbuf_pkthdr_rcvif(m);
 			goto sendit;
+		}
+
+		/*
+		 * PATCH [local-p6]: ic_mgtq and if_snd are different queues.
+		 * The old code returned early whenever if_snd was oactive, so
+		 * an AUTH/ASSOC/DEAUTH waiting in ic_mgtq had to wait for the
+		 * next watchdog tick (measured 300-900 ms, far outside what an
+		 * AP tolerates between AUTH and ASSOC_REQ).  Management output
+		 * above always runs first; only data is held back here.
+		 *
+		 * Reaching this point means mwx_tx_has_room() succeeded just
+		 * above, so an oactive flag here is stale - the ring has room
+		 * again but nobody cleared the flag.  Clear it and carry on.
+		 */
+		if (ifq_is_oactive(&ifp->if_snd)) {
+			static uint32_t oactive_logs;
+			if (oactive_logs < 16) {
+				MWX_DEV_LOG(sc,
+				    "txstart stale oactive cleared after mgmt\n");
+				oactive_logs++;
+			}
+			ifq_clr_oactive(&ifp->if_snd);
 		}
 
 		if (ic->ic_state != IEEE80211_S_RUN ||
@@ -1599,6 +1633,23 @@ mwx_start(struct ifnet *ifp)
 		if (ic->ic_rawbpf != NULL)
 			bpf_mtap(ic->ic_rawbpf, m, BPF_DIRECTION_OUT);
 #endif
+		/* PATCH [local-p6]: prove whether a mgmt frame left the driver. */
+		{
+			struct ieee80211_frame *mwh =
+			    mtod(m, struct ieee80211_frame *);
+			if ((mwh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) ==
+			    IEEE80211_FC0_TYPE_MGT) {
+				static uint32_t mgmt_logs;
+				if (mgmt_logs < 32) {
+					MWX_DEV_LOG(sc,
+					    "txstart mgmt subtype=0x%02x len=%zu state=%d\n",
+					    mwh->i_fc[0] &
+					    IEEE80211_FC0_SUBTYPE_MASK,
+					    mbuf_len(m), ic->ic_state);
+					mgmt_logs++;
+				}
+			}
+		}
 		int rv = mwx_tx(sc, m, ni);
 		/* mwx_tx copies node metadata into the descriptor; completion uses
 		 * the packet/token only, so release the enqueue reference here. */
@@ -1857,6 +1908,9 @@ mwx_newstate_task(void *ptr)
 
 	switch (nstate) {
 	case IEEE80211_S_INIT:
+		/* PATCH [local-p19]: the join was abandoned; disarm the echo guard
+		 * so an unrelated deauth in a later attempt is not swallowed */
+		MWX_ARM_PREAUTH_DEAUTH(ic, false);
 		break;
 	case IEEE80211_S_SCAN:
 		rv = mwx_scan(sc);
@@ -1864,6 +1918,35 @@ mwx_newstate_task(void *ptr)
 			break;
 		break;
 	case IEEE80211_S_AUTH:
+		/*
+		 * PATCH [local-p16]: entering AUTH means a join owns the radio
+		 * from here on.  A walk that is still hopping channels only
+		 * steals airtime from the AUTH / ASSOC exchange and, when it
+		 * completes before we reach RUN, makes ieee80211_end_scan()
+		 * restart the state machine (see mwx_end_scan_task).  Abort it
+		 * up front.  When the walk already finished this is a no-op:
+		 * mt7921_mcu_hw_scan_cancel() clears MWX_FLAG_SCANNING on
+		 * success but the flag is tested first.
+		 */
+		if (sc->sc_flags & MWX_FLAG_SCANNING) {
+			MWX_DEV_LOG(sc, "AUTH: aborting running scan\n");
+			mt7921_mcu_hw_scan_cancel(sc);
+		}
+		/*
+		 * PATCH [local-p10]: the AID of a finished association must
+		 * not survive into the next one.  ieee80211_recv_assoc_resp()
+		 * now drops ASSOC_RESP for an association whose AID is
+		 * already assigned (duplicate-response filter), so a stale
+		 * AID would make the next join look like a duplicate and be
+		 * silently ignored.  Only the S_SCAN branch of the net80211
+		 * state machine used to clear it, but the deauth / assoc
+		 * retry path is RUN -> AUTH -> ASSOC with no scan in between.
+		 */
+		if (ic->ic_bss != NULL && ic->ic_bss->ni_associd != 0) {
+			MWX_DEV_LOG(sc, "AUTH: clearing stale aid=%d\n",
+			    ic->ic_bss->ni_associd);
+			ic->ic_bss->ni_associd = 0;
+		}
 		rv = mt7921_set_channel(sc);
 		if (rv)
 			break;
@@ -1883,9 +1966,34 @@ mwx_newstate_task(void *ptr)
 			IEEE80211_SEND_MGMT(ic, ic->ic_bss,
 			    IEEE80211_FC0_SUBTYPE_DEAUTH,
 			    IEEE80211_REASON_AUTH_LEAVE);
-			mwx_start(&ic->ic_if);
+			/*
+			 * PATCH [local-p5]: mwx_start(&ic->ic_if) used to be
+			 * called here.  start() belongs to the ifnet queue
+			 * machinery and must not be driven from inside a state
+			 * transition; doing so left the tx queue in a state
+			 * where the ASSOC_REQ that net80211 queues ~40 ms later
+			 * was dropped, pushing the frame out to debugPoll's 1 s
+			 * timer instead (measured 296 ms).  The AP answers a
+			 * late ASSOC_REQ with deauth(reason 9) after ~300 ms, so
+			 * that delay is fatal; on the runs that worked the
+			 * AUTH -> ASSOC_REQ gap was 38 ms.
+			 */
 			MWX_DEV_LOG(sc, "AUTH: pre-auth deauth sent to %s\n",
 			    ether_sprintf(ic->ic_bss->ni_macaddr));
+			/*
+			 * PATCH [local-p19]: arm the echo guard.  Some APs
+			 * (measured on an Android hotspot) answer a
+			 * deauth(reason 3) with a deauth(reason 1) of their
+			 * own 23 ms later.  ieee80211_recv_deauth() hands any
+			 * deauth to ic_event_handler, so WCL reported it as
+			 * "join complete status=1" and tore down a join that
+			 * had not even sent AUTH yet -- every wrong-password
+			 * round burned its first attempt on this.  The flag
+			 * is cleared on entering S_ASSOC (auth really worked)
+			 * and on S_RUN/S_INIT, so a genuine deauth later in
+			 * the join is still processed normally.
+			 */
+			MWX_ARM_PREAUTH_DEAUTH(ic, true);
 		}
 		if (sc->sc_sta_added) {
 			int srv = mt7921_mac_sta_update(sc, sc->sc_ic.ic_bss, 0, 0);
@@ -1897,11 +2005,52 @@ mwx_newstate_task(void *ptr)
 		break;
 	case IEEE80211_S_ASSOC:
 		mwx_mcu_set_deep_sleep(sc, 1);
+		/* PATCH [local-p19]: AUTH succeeded, so that window is closed and a
+		 * deauth from here on is the AP's real opinion of us. */
+		MWX_ARM_PREAUTH_DEAUTH(ic, false);
+		/*
+		 * PATCH [local-p5]: net80211 already sent ASSOC_REQ in its
+		 * S_AUTH -> S_ASSOC transition, but ieee80211_mgmt_output()
+		 * can fail there (tx queue not ready right after the AUTH
+		 * exchange) and the frame is simply dropped - no immediate
+		 * retry, only debugPoll's 1 s timer.  Re-sending here is
+		 * harmless when the first one did go out (duplicate
+		 * ASSOC_REQ just makes the AP resend ASSOC_RESP) and keeps
+		 * the AUTH -> ASSOC_REQ gap inside the AP's ~300 ms window.
+		 */
+		/*
+		 * PATCH [local-p9]: only resend when we are *entering*
+		 * S_ASSOC from AUTH.  A RUN -> ASSOC transition means the AP
+		 * just tore the association down (deauth/disassoc, e.g. the
+		 * wrong-key 4-way), and at that moment the AP has already
+		 * dropped our auth state - an ASSOC_REQ sent now is answered
+		 * with a fresh association (new AID) that we instantly
+		 * abandon, or with a "class 3 frame" deauth.  Measured in the
+		 * 10-round wrong-password test: every deauth reason 15 was
+		 * followed by "ASSOC: immediate resend" 30 ms later and the
+		 * AP still handed out a new associd before airportd moved to
+		 * S_SCAN.  net80211's own ASSOC_REQ from the AUTH -> ASSOC
+		 * transition is unaffected, so the 300 ms AP window this
+		 * patch chain cares about is unchanged.
+		 */
+		if (ostate != IEEE80211_S_RUN &&
+		    ic->ic_opmode == IEEE80211_M_STA && ic->ic_bss != NULL) {
+			int crv = ieee80211_send_mgmt(ic, ic->ic_bss,
+			    IEEE80211_FC0_SUBTYPE_ASSOC_REQ, 0, 0);
+			MWX_DEV_LOG(sc, "ASSOC: immediate resend rv=%d\n", crv);
+		} else if (ostate == IEEE80211_S_RUN &&
+		    ic->ic_opmode == IEEE80211_M_STA) {
+			MWX_DEV_LOG(sc, "ASSOC: skip resend, came from RUN "
+			    "(peer gone) aid=%d\n",
+			    ic->ic_bss != NULL ? ic->ic_bss->ni_associd : -1);
+		}
 		break;
 	case IEEE80211_S_RUN:
 		if (ic->ic_opmode == IEEE80211_M_MONITOR)
 			break;
 
+		/* PATCH [local-p19]: the join is over; nothing to guard any more */
+		MWX_ARM_PREAUTH_DEAUTH(ic, false);
 		mt7921_mcu_hw_scan_cancel(sc);
 		mwx_mcu_set_deep_sleep(sc, 0);
 		{
@@ -1942,10 +2091,61 @@ mwx_newstate_task(void *ptr)
 		break;
 	}
 
-	if (rv)
+	if (rv) {
 		mwx_reset(sc);
-	else
+	} else {
 		sc->sc_newstate(ic, nstate, arg);
+		/*
+		 * PATCH [local-p6]: once the state machine is really in
+		 * S_ASSOC, repeat the ASSOC_REQ a couple of times, spaced
+		 * ~20 ms.  Every attempt that associated had a second
+		 * ASSOC_REQ arrive ~15 ms after the first; every attempt
+		 * that failed left the next one to debugPoll (300-900 ms),
+		 * which this AP answers with deauth(reason 9) because its
+		 * auth context has already expired.  Frames are only queued
+		 * here (they go out through mwx_start), so the short delay
+		 * simply lets the previous one clear the TX ring instead of
+		 * piling three copies into the same burst.
+		 */
+		if (nstate == IEEE80211_S_ASSOC && ostate != IEEE80211_S_RUN &&
+		    ic->ic_opmode == IEEE80211_M_STA && ic->ic_bss != NULL) {
+			int i;
+			for (i = 0; i < 2; i++) {
+				delay(20 * 1000);
+				/*
+				 * PATCH [local-p8]: ic_state lags the real
+				 * progress.  ieee80211_recv_assoc_resp()
+				 * sets ni_associd and only then calls
+				 * new_state(S_RUN); with the resend loop
+				 * sleeping here, the ASSOC_RESP can be
+				 * processed in between, so a resend fired
+				 * after a successful association.  The AP
+				 * treats the extra ASSOC_REQ as a fresh
+				 * association, drops our 4-way msg 2/4 and
+				 * the join stalls for the full 20 s
+				 * airportd timeout (-3912).  Measured:
+				 * 8/10 joins ok, 2/10 stalled exactly there
+				 * (log showed "paced resend 2" after
+				 * "recv_assoc_resp nstate=4").  So stop as
+				 * soon as the AID is assigned.
+				 */
+				if (ic->ic_state != IEEE80211_S_ASSOC)
+					break;
+				if (ic->ic_bss->ni_associd != 0) {
+					MWX_DEV_LOG(sc,
+					    "ASSOC: resend stopped, associd=%d\n",
+					    ic->ic_bss->ni_associd);
+					break;
+				}
+				int brv = ieee80211_send_mgmt(ic, ic->ic_bss,
+				    IEEE80211_FC0_SUBTYPE_ASSOC_REQ, 0, 0);
+				MWX_DEV_LOG(sc,
+				    "ASSOC: paced resend %d rv=%d state=%d aid=%d\n",
+				    i + 1, brv, ic->ic_state,
+				    ic->ic_bss->ni_associd);
+			}
+		}
+	}
 	splx(s);
 }
 
@@ -5870,6 +6070,14 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	int n_ssids = 0;
 	int rv;
 	uint8_t nchan, n_2g = 0, n_5g = 0;
+	/*
+	 * DIAG [scan-5g] (local, not upstream): when the request comes from
+	 * AirportWCL it is filtered by the channel bitmap the client sent.
+	 * "2g=14 5g=0" can therefore mean either "the adapter has no 5 GHz
+	 * channels" or "the bitmap selected none of them". Count both sides
+	 * so the log tells which one it is.
+	 */
+	unsigned avail_5g = 0, skipped_restricted = 0;
 
 	m = mwx_mcu_alloc_msg(sizeof(*req));
 	if (m == NULL)
@@ -5931,11 +6139,16 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 
 		if (c->ic_flags == 0)
 			continue;
+		if (IEEE80211_IS_CHAN_5GHZ(c))
+			avail_5g++;
 #ifdef AIRPORT_WCL
 		if (!AirportWCL::scanChannelSelected(ic->ic_wcl_scan_channels,
 		    ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted,
-		    ieee80211_mhz2ieee(c->ic_freq, 0)))
+		    ieee80211_mhz2ieee(c->ic_freq, 0))) {
+			if (IEEE80211_IS_CHAN_5GHZ(c))
+				skipped_restricted++;
 			continue;
+		}
 #endif
 
 		if (nchan < 32)
@@ -5989,12 +6202,19 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 #endif
 
 	MWX_DEV_LOG(sc,
-	    "scan request seq=%u channels=%u 2g=%u 5g=%u primary=%u ext=%u timeout=%u dwell=%u min_dwell=%u scan_func=0x%08x ssid_type=0x%x\n",
+	    "scan request seq=%u channels=%u 2g=%u 5g=%u primary=%u ext=%u timeout=%u dwell=%u min_dwell=%u scan_func=0x%08x ssid_type=0x%x has5g=%d avail5g=%u restricted=%d skipped5g=%u\n",
 	    sc->sc_scan_seq_num, nchan, n_2g, n_5g, req->channels_num,
 	    req->ext_channels_num, le16toh(req->timeout_value),
 	    le16toh(req->channel_dwell_time),
 	    le16toh(req->channel_min_dwell_time),
-	    le32toh(req->scan_func), req->ssid_type);
+	    le32toh(req->scan_func), req->ssid_type,
+	    sc->sc_capa.has_5ghz, avail_5g,
+#ifdef AIRPORT_WCL
+	    ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted,
+#else
+	    0,
+#endif
+	    skipped_restricted);
 
 	rv = mwx_mcu_send_mbuf(sc, MCU_CE_CMD_START_HW_SCAN, m, NULL);
 	if (rv != 0)
@@ -6036,10 +6256,22 @@ mwx_end_scan_task(void *arg)
 	 * net80211 choose and re-join the BSS we had just associated to
 	 * (without a deauth), which the AP then ignored. Only background
 	 * scans may complete while associated.
+	 *
+	 * PATCH [local-p16]: the same staleness applies one state earlier.
+	 * A join started from the cached-node shortcut (WCL.cpp) enters AUTH
+	 * while the walk is still hopping channels, so scan completion lands
+	 * in S_AUTH/S_ASSOC instead of S_RUN.  ieee80211_end_scan() then
+	 * unconditionally selects a BSS and calls ieee80211_node_join_bss(),
+	 * which restarts the machine from AUTH and throws away the AUTH /
+	 * ASSOC frames already in flight: measured two wasted ASSOC_REQ
+	 * retries plus an association the AP kicked with reason 4
+	 * (inactivity) 40 ms after we reached RUN, worth 16.1 s per join.
+	 * Any state at or past AUTH means "a join owns the radio now".
 	 */
-	if (ic->ic_state == IEEE80211_S_RUN &&
+	if (ic->ic_state >= IEEE80211_S_AUTH &&
 	    (ic->ic_flags & IEEE80211_F_BGSCAN) == 0) {
-		MWX_DEV_LOG(sc, "ignoring stale scan completion in RUN\n");
+		MWX_DEV_LOG(sc, "ignoring stale scan completion in state %d\n",
+		    ic->ic_state);
 		splx(s);
 		return;
 	}
@@ -9153,19 +9385,43 @@ MtkMwx::debugPoll()
 	 * frame (seen on 2.4 GHz: AUTH answered, ASSOC response never came)
 	 * thus cost ~20 s at boot. Retransmit like mac80211 does, once per
 	 * poll, up to three times.
+	 *
+	 * PATCH [arxusion-37aa87e] (Arxusion/AirportMtkWlan, 2026-11-04):
+	 * the cap above was unreachable. The counter was reset on every
+	 * ic_state change, and an AP that answers AUTH but drops ASSOC (or
+	 * sends a stale-session DISASSOC) flips AUTH <-> ASSOC every few
+	 * seconds, so `retries` never left 1..2 and the station retried
+	 * forever. Key the reset on the peer BSSID too, and give up by
+	 * returning to S_INIT once three rounds on the same peer are spent.
+	 * That stops the endless 4 s loop that redrew the Wi-Fi menu while
+	 * the user was still typing the password.
+	 *
+	 * PATCH [local-retry-window] (2026-11-08): the BSSID key alone did
+	 * not help -- the state still flipped AUTH<->ASSOC every round, so
+	 * `retry_state != ic_state` reset `retries` before it could ever
+	 * reach 2.  Measured on an AP that answers ASSOC with deauth(reason
+	 * 9): 34 AUTH and 36 ASSOC retries, all logged "retry 1".  Drop the
+	 * state term from the reset condition entirely and count retries per
+	 * peer only, so the budget is spent across both states (6 sends ~=
+	 * 12 s) and the loop terminates.  A peer change or any state outside
+	 * AUTH/ASSOC still resets the counter.
 	 */
 	{
-		static int retry_state = -1, retries;
+		static int retries;
+		static uint8_t last_peer[IEEE80211_ADDR_LEN];
 
 		if (ic->ic_opmode == IEEE80211_M_STA && ic->ic_mgt_timer != 0 &&
 		    (ic->ic_state == IEEE80211_S_AUTH ||
-		    ic->ic_state == IEEE80211_S_ASSOC)) {
-			if (retry_state != ic->ic_state) {
-				retry_state = ic->ic_state;
+		    ic->ic_state == IEEE80211_S_ASSOC) && ic->ic_bss != NULL) {
+			if (memcmp(last_peer, ic->ic_bss->ni_macaddr,
+			    IEEE80211_ADDR_LEN) != 0) {
+				memcpy(last_peer, ic->ic_bss->ni_macaddr,
+				    IEEE80211_ADDR_LEN);
 				retries = 0;
-			} else if (retries < 3) {
+			}
+			if (retries < 6) {
 				retries++;
-				MWX_DEV_LOG(sc, "%s retry %d to %s\n",
+				MWX_DEV_LOG(sc, "%s retry %d/6 to %s\n",
 				    ic->ic_state == IEEE80211_S_AUTH ?
 				    "AUTH" : "ASSOC", retries,
 				    ether_sprintf(ic->ic_bss->ni_macaddr));
@@ -9175,9 +9431,106 @@ MtkMwx::debugPoll()
 				else
 					IEEE80211_SEND_MGMT(ic, ic->ic_bss,
 					    IEEE80211_FC0_SUBTYPE_ASSOC_REQ, 0);
+			} else {
+				MWX_DEV_LOG(sc, "retries exhausted for %s in "
+				    "state %d, resetting to S_INIT\n",
+				    ether_sprintf(ic->ic_bss->ni_macaddr),
+				    ic->ic_state);
+				retries = 0;
+				memset(last_peer, 0, IEEE80211_ADDR_LEN);
+				ieee80211_new_state(ic, IEEE80211_S_INIT, -1);
 			}
-		} else
-			retry_state = -1;
+		} else {
+			retries = 0;
+			memset(last_peer, 0, IEEE80211_ADDR_LEN);
+		}
+	}
+
+	/*
+	 * PATCH [local-p12]: a station parked in AUTH/ASSOC with
+	 * ic_mgt_timer == 0 is dead -- the retransmit block above needs a
+	 * live timer, and nothing else re-drives the state machine, so it
+	 * stays there until the radio is power cycled.  That is exactly
+	 * what a disassoc(RUN) + deauth(AUTH) pair did on 2026-11-09:
+	 * state=2 for 29 rounds, no "AUTH retry", every scan answered with
+	 * "WCL scan reject: authing state=2".  A state transition whose
+	 * entry action sends no frame legitimately leaves no timer behind
+	 * (see the P12 note in ieee80211_recv_disassoc()), so treat six
+	 * consecutive polls (~6 s) with no timer as a wedged machine and
+	 * restart from S_INIT.  A normal join always arms the timer within
+	 * the same transition, so this never fires on a healthy one.
+	 */
+	{
+		static int dead_polls;
+		static int dead_state;
+
+		if (ic->ic_opmode == IEEE80211_M_STA &&
+		    (ic->ic_state == IEEE80211_S_AUTH ||
+		     ic->ic_state == IEEE80211_S_ASSOC) &&
+		    ic->ic_mgt_timer == 0) {
+			if (dead_state != ic->ic_state) {
+				dead_state = ic->ic_state;
+				dead_polls = 0;
+			}
+			if (++dead_polls >= 6) {
+				MWX_DEV_LOG(sc, "dead state %d without mgt "
+				    "timer, resetting to S_INIT\n",
+				    ic->ic_state);
+				dead_polls = 0;
+				dead_state = -1;
+				ieee80211_new_state(ic, IEEE80211_S_INIT, -1);
+			}
+		} else {
+			dead_polls = 0;
+			dead_state = -1;
+		}
+	}
+
+	/*
+	 * PATCH [local-p14]: count RUN entries in a time window instead of
+	 * per peer / per node.
+	 *
+	 * The first cut of this guard keyed on ic_bss->ni_macaddr and reset
+	 * on "no ic_bss".  A disassoc drops the node, so ic_bss went NULL
+	 * between every cycle and the counter was cleared each time -- it
+	 * never reached the threshold even though the station entered RUN
+	 * 33 times in 150 s.  Anchor on time instead: a healthy association
+	 * enters RUN once and then stays there, so five entries inside 60 s
+	 * is unambiguously a handshake that can never complete.
+	 */
+	{
+		static uint64_t last_run_ns;
+		static uint64_t first_run_ns;
+		static int prev_state = -1;
+		static int run_entries;
+		uint64_t now_ns = 0;
+
+		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
+		if (ic->ic_opmode == IEEE80211_M_STA &&
+		    ic->ic_state == IEEE80211_S_RUN &&
+		    prev_state != IEEE80211_S_RUN) {
+			if (first_run_ns == 0 ||
+			    now_ns - first_run_ns > 60000000000ULL) {
+				first_run_ns = now_ns;
+				run_entries = 0;
+			}
+			run_entries++;
+			last_run_ns = now_ns;
+			if (run_entries >= 5) {
+				MWX_DEV_LOG(sc, "reached RUN %d times in %llu ms, "
+				    "4-way never settles, resetting to S_INIT\n",
+				    run_entries,
+				    (unsigned long long)((now_ns - first_run_ns) /
+				    1000000ULL));
+				run_entries = 0;
+				first_run_ns = 0;
+				last_run_ns = 0;
+				prev_state = -1;
+				ieee80211_new_state(ic, IEEE80211_S_INIT, -1);
+			}
+		}
+		prev_state = ic->ic_state;
+		(void)last_run_ns;
 	}
 
 	sta = mwx_read(sc, MT_WFDMA0_HOST_INT_STA);
