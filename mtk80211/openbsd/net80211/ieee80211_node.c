@@ -1554,7 +1554,13 @@ ieee80211_end_scan(struct _ifnet *ifp)
      * out of the node tree and form a zombie association airportd never
      * learned about.  Just drop the bgscan marker; airportd reconnects
      * with a fresh join request when it sees the link go down.
+     *
+     * WCL-only: the fields live under #ifdef AIRPORT_WCL, and the
+     * SimpleMtkWlan product has no airportd behind it -- its joins are
+     * driven through the IOUserClient and end_scan picking a BSS is the
+     * normal path there.
      */
+#ifdef AIRPORT_WCL
     if (!ic->ic_wcl_join_requested) {
         if (bgscan)
             ic->ic_flags &= ~IEEE80211_F_BGSCAN;
@@ -1564,6 +1570,7 @@ ieee80211_end_scan(struct _ifnet *ifp)
         }
         return;
     }
+#endif
 
     /* Possibly switch which ssid we are associated with */
     if (!bgscan && ic->ic_opmode == IEEE80211_M_STA)

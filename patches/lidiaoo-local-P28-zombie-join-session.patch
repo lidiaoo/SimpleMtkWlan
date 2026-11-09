@@ -1,6 +1,6 @@
---- a/AirportMtkWlan/WCL/WCL.cpp	2026-11-09 16:22:50
-+++ b/AirportMtkWlan/WCL/WCL.cpp	2026-11-09 16:20:31
-@@ -1178,6 +1178,17 @@
+--- a/AirportMtkWlan/WCL/WCL.cpp
++++ b/AirportMtkWlan/WCL/WCL.cpp
+@@ -1188,6 +1188,17 @@
              ieee80211_new_state(ic, IEEE80211_S_INIT, -1);
          }
      } else {
@@ -18,9 +18,9 @@
          /* PATCH [local-p18]: the key is live again, so a later zero-PSK
           * report is a genuine fault and must not be suppressed. */
          fHalService->get80211Controller()->ic_wcl_psk_wiped = false;
---- a/mtk80211/openbsd/net80211/ieee80211_node.c	2026-11-09 11:18:20
-+++ b/mtk80211/openbsd/net80211/ieee80211_node.c	2026-11-09 16:22:01
-@@ -1545,6 +1545,26 @@
+--- a/mtk80211/openbsd/net80211/ieee80211_node.c
++++ b/mtk80211/openbsd/net80211/ieee80211_node.c
+@@ -1545,6 +1545,33 @@
          return;
      }
      
@@ -33,7 +33,13 @@
 +     * out of the node tree and form a zombie association airportd never
 +     * learned about.  Just drop the bgscan marker; airportd reconnects
 +     * with a fresh join request when it sees the link go down.
++     *
++     * WCL-only: the fields live under #ifdef AIRPORT_WCL, and the
++     * SimpleMtkWlan product has no airportd behind it -- its joins are
++     * driven through the IOUserClient and end_scan picking a BSS is the
++     * normal path there.
 +     */
++#ifdef AIRPORT_WCL
 +    if (!ic->ic_wcl_join_requested) {
 +        if (bgscan)
 +            ic->ic_flags &= ~IEEE80211_F_BGSCAN;
@@ -43,6 +49,7 @@
 +        }
 +        return;
 +    }
++#endif
 +
      /* Possibly switch which ssid we are associated with */
      if (!bgscan && ic->ic_opmode == IEEE80211_M_STA)
