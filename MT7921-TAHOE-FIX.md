@@ -1,8 +1,10 @@
-# MT7921 macOS 26 (Tahoe) Wi-Fi 修复补丁集（P20–P29）
+# MT7921 macOS 26 (Tahoe) Wi-Fi 修复补丁集（P1–P29，含前置 ALL-baseline-to-P19）
 
 针对 [`lidiaoo/SimpleMtkWlan`](https://github.com/lidiaoo/SimpleMtkWlan) 的 MediaTek MT7921 (`14c3:7961`) 驱动修复集，
 解决 macOS 26.7 (Tahoe) 上的一系列 Wi-Fi 缺陷：5G 网络扫不到/进不了列表、列表剧烈跳动、
 连接全挂（僵尸关联）、PHY Mode 显示 None 等。
+补丁链分两批：**P1–P19**（前置，join/状态机/密钥层，打包为 `ALL-baseline-to-P19` 一个补丁）
+与 **P20–P29**（扫描/发布/会话层，10 个独立补丁），两批缺一不可，按序全部应用。
 
 **测试环境**：Acer Nitro 5（i7-11800H）· MT7921 · macOS Tahoe 26.7.2 · OpenCore
 
@@ -19,6 +21,49 @@
 ---
 
 ## 修复内容
+
+### 0. 前置修复（`ALL-baseline-to-P19`，即 P1–P19，2026-11-06 ~ 11-09）
+
+在 P20 之前，这批补丁已经把 WCL join/状态机层面的一批致命问题修掉——
+没有它们，P20–P29 的扫描/发布修复根本无从谈起。按主题归纳：
+
+**扫描通道（WCL.cpp）**
+- **P7 扫描窗口卡死**：信道 walk 被 join 打断后 `SCAN_DONE` 事件可能永远不来，
+  `scanPending` 永久锁存，之后所有扫描请求都回 `kIOReturnBusy`——
+  表现为「Wi-Fi 菜单空了，只能关开 Wi-Fi 电源」。修复：窗口关闭时清理锁存，
+  扫描结束把节点树缓存一次性补发给 IO80211（`publishWCLCachedResults`，
+  IO80211 只认 postMessage，不读驱动的节点树）
+- **P15 join 重放**：join 在扫描进行中到达时不再被拒（`kIOReturnBusy` 会让
+  airportd 直接丢弃请求），记为 deferred，扫描完自动重放
+- **P1–P4 诊断**：WCL 扫描请求原始信道表/flags dump（`DIAG [scan-5g]`），
+  用于实锤 decodeScan 三条猜测规则把 5G 信道 bitmap 全部丢掉的事实
+
+**关联状态机（MtkMwx.cpp / ieee80211_input.c）**
+- **P5/P6 发送路径**：管理帧（AUTH/ASSOC/DEAUTH）走 `ic_mgtq`，旧代码在数据队列
+  oactive 时提前 return，管理帧被无限期阻塞；net80211 已在状态切换时发过
+  ASSOC_REQ，驱动不再重复发
+- **P8/P10 关联响应**：关联成功后不再重复发 ASSOC_REQ（`ic_state` 滞后竞态）；
+  一次 ASSOC_REQ 只接受一份 ASSOC_RESP，过期 AID 不跨关联残留
+- **P9 重发时机**：只在 AUTH→S_ASSOC 进入时重发；RUN→ASSOC 意味着 AP 已拆链，
+  此时发 ASSOC_REQ 只会换来 class 3 frame deauth
+- **P12 死机检测**：AUTH/ASSOC 停滞且 `ic_mgt_timer==0`（没有任何东西会再驱动
+  状态机）连续 6 个轮询周期 → 判定卡死，从 S_INIT 重来。实测状态机曾在
+  state=2 停了 29 轮，所有扫描请求被 "authing state=2" 拒绝
+- **P14 RUN 风暴守卫**：60 秒窗口内 5 次进入 RUN = 握手永远完不成，重置；
+  已有 PMK 时不再重新认证
+
+**密钥与节点（ieee80211_node.c / var.h）**
+- **P13 空 PSK 不覆盖**：WCL join 把 PMK 直接写进 `ic_psk`，而 ESS 表项里的
+  `ess->psk` 是 32 个零字节——切网络时 `set_ess` 曾把真密钥覆盖成全零，
+  4-way 用零密钥跑，AP 连拒 msg 2/4 九次、永远连不上。实测日志
+  `key check b0`（对密码）→ 600ms 后 `key check 80`（零字节哈希）
+- **P17 空壳节点**：`leaveWCLNetwork()` 清空过的节点仍挂在 `ic_tree` 里
+  （protos/akms/ciphers 全 0），join 它会把空 MAC 拷进 `ic_bss`，AUTH 重试发往
+  `ff:ff:ff:ff:ff:ff` 六轮（实测浪费 20.9 秒）。修复：要求节点信息完整才可 join
+- **P18/P19 deauth 语义守卫**：区分「我们自己抹的 PSK」（join 失败/leave，正常）
+  与「真故障」；S_AUTH 进入时驱动的 pre-auth deauth 会引来部分 AP 的 deauth
+  回声，加 `ic_wcl_preauth_deauth` 标记防止 net80211 把真 deauth 当回声吞掉；
+  全部走 `AIRPORT_WCL` 宏守卫，SimpleMtkWlan 产品编译不受影响
 
 ### 1. 全信道扫描（P20+P21+P22）
 - 扫描窗口与 dwell 时间统一（全扫 80ms/信道），去掉 `SPLIT_SCAN` 分割扫描

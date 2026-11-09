@@ -37,7 +37,7 @@
 > 上的实测记录，含吞吐数据和两个害我们多花好几天的坑。
 > 见 [实测记录](#实测记录mt7921-在-tahoe-上)。英文版见 [README.en.md](README.en.md)。
 
-> **⭐ MT7921 (Tahoe 26.7) Wi-Fi 修复补丁集 P20–P29 已发布**
+> **⭐ MT7921 (Tahoe 26.7) Wi-Fi 修复补丁集 P1–P29 已发布**
 > 如果你遇到 **5G 网络扫不到 / Wi-Fi 列表跳动、连接全挂（开关 Wi-Fi 后连不上任何网络）、
 > 系统信息里 PHY Mode 显示 None** ——这些都在
 > **[MT7921-TAHOE-FIX.md](MT7921-TAHOE-FIX.md)** 里有完整的根因分析、修复内容、
@@ -331,9 +331,12 @@ CI 在每次 push 和 pull request 上构建 Debug 与 Release；推送 `vX.Y.Z`
 * **中断调度：** 分发改到 `IOFilterInterruptEventSource`，
   并把 RX 重调度限制为每次中断一个工作项。
 * **WCL：** 遵守系统的漫游锁，并暴露 TX 反压计数器供原生 Wi-Fi 诊断使用。
-* **Tahoe Wi-Fi 修复集（P20–P29）：** 全信道扫描、节点表扩容（5G 管理帧不再被吞）、
-  Beacon IE 完整合成（PHY Mode 显示 None 的根因）、批量发布消除列表抖动、
-  僵尸关联修复（连接全挂的根因，join 成功率 0/10 → 9/9）。
+* **Tahoe Wi-Fi 修复集（P1–P29）：** 前置 P1–P19（`ALL-baseline-to-P19`）修掉
+  join/状态机/密钥层的致命问题——扫描窗口卡死（菜单空到只能电源循环）、管理帧被
+  数据队列阻塞、AUTH/ASSOC 停滞死机检测、空 PSK 覆盖真密钥（4-way 用零密钥连不上）、
+  空壳节点 join、pre-auth deauth 回声守卫；P20–P29 修扫描/发布/会话层——全信道扫描、
+  节点表扩容（5G 管理帧不再被吞）、Beacon IE 完整合成（PHY Mode 显示 None 的根因）、
+  批量发布消除列表抖动、僵尸关联修复（连接全挂的根因，join 成功率 0/10 → 9/9）。
   完整的根因分析、逐项验证数据与安装说明见 **[MT7921-TAHOE-FIX.md](MT7921-TAHOE-FIX.md)**。
 * **测试与构建：** 扩展 host 测试覆盖 HE TLV、DMA 池、A-MSDU/A-MPDU、扫描与漫游；
   支持从干净克隆构建，并由 CI 发布。
