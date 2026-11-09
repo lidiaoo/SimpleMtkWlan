@@ -162,7 +162,7 @@ done
 | `P25-beacon-ies` | 167 | `584094ff6f6d6919` |
 | `P26-single-completion` | 142 | `eb5e272fa5261a93` |
 | `P27-live-hold` | 67 | `1ab2209deb52a50a` |
-| `P28-zombie-join-session` | 49 | `0794166e2b4dadba` |
+| `P28-zombie-join-session` | 51 | `fdb809eeb3df3721` |
 | `P29-dsparams-5g` | 60 | `459393d5d7a543fc` |
 
 全链已验证：`c28b1d8` + 11 个补丁 = 与实测源码树逐字节一致；编译产物
