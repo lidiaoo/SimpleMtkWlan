@@ -10,6 +10,12 @@
 
 ![Wi-Fi 面板](screenshots/wifi-panel-crop.png)
 
+![系统信息 - Wi-Fi](screenshots/sysinfo-wifi.png)
+
+> 系统信息 > Wi-Fi 详情：PHY Mode 正确显示 802.11ac（当前连接，ch40/80MHz），
+> 其他本地网络逐条显示 802.11a/n/ac（P25 补全 beacon IE 前这里全是 None），
+> 固件 `IO80211Texts_1566.6`、支持信道 1~165 全列。
+
 ---
 
 ## 修复内容
