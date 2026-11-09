@@ -1,0 +1,167 @@
+diff --git a/AirportMtkWlan/WCL/WCL.cpp b/AirportMtkWlan/WCL/WCL.cpp
+--- a/AirportMtkWlan/WCL/WCL.cpp
++++ b/AirportMtkWlan/WCL/WCL.cpp
+@@ -489,6 +489,115 @@
+      */
+     finishWCLScan((scanCompleted || wclScanResults) ? kIOReturnSuccess
+                                                     : kIOReturnTimeout);
++}
++
++/*
++ * PATCH [local-p25]: rebuild the information elements the way a real beacon
++ * carries them.
++ *
++ * The node keeps parsed state rather than the raw frame, so the cache dump
++ * used to re-serialise only the SSID and the RSN element.  Every entry then
++ * reached airportd without a rate set, without DS parameters and without any
++ * HT/VHT capability -- which shows up as "PHY Mode: None" in system_profiler.
++ *
++ * The visible cost was in the scan cache.  airportd splits a sweep into a
++ * 2.4 GHz subset and a 5 GHz one; the 2.4 GHz half answered from cache
++ * ("Successful cache-assisted"), but the 5 GHz half failed that test on every
++ * pass and had to be scanned again, so the menu alternated between a
++ * 2.4 GHz-only list and the full one.  A 5 GHz BSS is only allowed to be
++ * 802.11n or better, hence the suspicion that airportd was refusing to cache
++ * the 5 GHz entries for lack of the HT/VHT elements.
++ *
++ * Everything here comes out of the node itself (ieee80211_parse_htcap() and
++ * friends filled it from the real frame), so the result describes the AP and
++ * not this adapter.  A caller-visible rate set is included because airportd
++ * derives the PHY mode from it.
++ */
++static size_t
++wclBuildBeaconIEs(ieee80211com *ic, const struct ieee80211_node *ni,
++    uint8_t *buf, size_t bufsize)
++{
++    uint8_t *frm = buf;
++    uint8_t *limit = buf + bufsize - 64;    /* room for the RSN element */
++    unsigned channel = ieee80211_chan2ieee(ic, ni->ni_chan);
++
++    if (limit < buf || ni->ni_esslen > 32)
++        return 0;
++
++    frm = ieee80211_add_ssid(frm, ni->ni_essid, ni->ni_esslen);
++    if (frm > limit)
++        return 0;
++
++    if (ni->ni_rates.rs_nrates > 0) {
++        frm = ieee80211_add_rates(frm, &ni->ni_rates);
++        if (ni->ni_rates.rs_nrates > IEEE80211_RATE_SIZE)
++            frm = ieee80211_add_xrates(frm, &ni->ni_rates);
++        if (frm > limit)
++            return 0;
++    }
++
++    *frm++ = IEEE80211_ELEMID_DSPARMS;
++    *frm++ = 1;
++    *frm++ = uint8_t(channel);
++    if (frm > limit)
++        return 0;
++
++    if (ni->ni_flags & IEEE80211_NODE_HTCAP) {
++        *frm++ = IEEE80211_ELEMID_HTCAPS;
++        *frm++ = 26;
++        LE_WRITE_2(frm, ni->ni_htcaps); frm += 2;
++        *frm++ = ni->ni_ampdu_param;
++        memcpy(frm, ni->ni_rxmcs, 10); frm += 10;
++        LE_WRITE_2(frm, ni->ni_max_rxrate & IEEE80211_MCS_RX_RATE_HIGH);
++        frm += 2;
++        *frm++ = ni->ni_tx_mcs_set;
++        *frm++ = 0; *frm++ = 0; *frm++ = 0;
++        LE_WRITE_2(frm, ni->ni_htxcaps); frm += 2;
++        LE_WRITE_4(frm, ni->ni_txbfcaps); frm += 4;
++        *frm++ = ni->ni_aselcaps;
++        if (frm > limit)
++            return 0;
++
++        *frm++ = IEEE80211_ELEMID_HTOP;
++        *frm++ = 22;
++        *frm++ = ni->ni_primary_chan ? ni->ni_primary_chan
++                                    : uint8_t(channel);
++        *frm++ = ni->ni_htop0;
++        LE_WRITE_2(frm, ni->ni_htop1); frm += 2;
++        LE_WRITE_2(frm, ni->ni_htop2); frm += 2;
++        memset(frm, 0, 16); frm += 16;
++        if (frm > limit)
++            return 0;
++    }
++
++    if (ni->ni_flags & IEEE80211_NODE_VHTCAP) {
++        *frm++ = IEEE80211_ELEMID_VHT_CAP;
++        *frm++ = 12;
++        LE_WRITE_4(frm, ni->ni_vhtcaps); frm += 4;
++        LE_WRITE_2(frm, ni->ni_vht_mcsinfo.rx_mcs_map); frm += 2;
++        LE_WRITE_2(frm, ni->ni_vht_mcsinfo.rx_highest); frm += 2;
++        LE_WRITE_2(frm, ni->ni_vht_mcsinfo.tx_mcs_map); frm += 2;
++        LE_WRITE_2(frm, ni->ni_vht_mcsinfo.tx_highest); frm += 2;
++        if (frm > limit)
++            return 0;
++
++        *frm++ = IEEE80211_ELEMID_VHT_OPMODE;
++        *frm++ = 5;
++        *frm++ = ni->ni_vht_chanwidth;
++        *frm++ = ni->ni_vht_chan1 ? ni->ni_vht_chan1 : uint8_t(channel);
++        *frm++ = ni->ni_vht_chan2;
++        LE_WRITE_2(frm, ni->ni_vht_basicmcs); frm += 2;
++        if (frm > limit)
++            return 0;
++    }
++
++    if (ni->ni_rsnprotos != 0) {
++        frm = ieee80211_add_rsn(frm, ic, ni);
++        if (frm > buf + bufsize)
++            return 0;
++    }
++
++    return size_t(frm - buf);
+ }
+ 
+ void AirportItlwmSkywalkInterface::publishWCLCachedResults()
+@@ -548,29 +657,32 @@
+         }
+         list[j] = key;
+     }
+-    unsigned logged = 0;
++    unsigned logged = 0, skipped = 0;
+     for (unsigned i = 0; i < nodes; ++i) {
+-        uint8_t ies[256];
+-        uint8_t *frm = ies;
+-        frm = ieee80211_add_ssid(frm, list[i]->ni_essid, list[i]->ni_esslen);
+-        if (list[i]->ni_rsnprotos != 0)
+-            frm = ieee80211_add_rsn(frm, ic, list[i]);
+         /*
+-         * PATCH [local-p24]: the strongest 5 GHz entries are logged so the
+-         * node table cap (200, see ieee80211_cache_size) can be told apart
+-         * from a WCL-side rejection without another rebuild.
++         * PATCH [local-p25]: hand over a beacon-shaped element list instead
++         * of SSID + RSN only.  See wclBuildBeaconIEs().
+          */
+-        if (logged < 4 && IEEE80211_IS_CHAN_5GHZ(list[i]->ni_chan)) {
+-            XYLog("p24 5g sample ch=%u rssi=%d esslen=%u ies=%zu\n",
++        uint8_t ies[320];
++        size_t length = wclBuildBeaconIEs(ic, list[i], ies, sizeof(ies));
++        if (length == 0) {
++            ++skipped;
++            continue;
++        }
++        if (logged < 4 && IEEE80211_IS_CHAN_5GHZ(list[i]->ni_chan)) {
++            XYLog("p25 5g sample ch=%u rssi=%d ies=%zu rates=%u ht=%d vht=%d\n",
+                 ieee80211_chan2ieee(ic, list[i]->ni_chan),
+-                IWM_MIN_DBM + list[i]->ni_rssi, list[i]->ni_esslen,
+-                size_t(frm - ies));
++                IWM_MIN_DBM + list[i]->ni_rssi, length,
++                list[i]->ni_rates.rs_nrates,
++                (list[i]->ni_flags & IEEE80211_NODE_HTCAP) != 0,
++                (list[i]->ni_flags & IEEE80211_NODE_VHTCAP) != 0);
+             ++logged;
+         }
+-        publishWCLBeacon(list[i], ies, size_t(frm - ies));
++        publishWCLBeacon(list[i], ies, length);
+     }
+     XYLog("publishWCLCachedResults nodes=%u 2g=%u 5g=%u published=%u "
+-        "maxnodes=%d\n", nodes, n2g, n5g, wclScanResults, ic->ic_max_nnodes);
++        "skipped=%u maxnodes=%d\n", nodes, n2g, n5g, wclScanResults,
++        skipped, ic->ic_max_nnodes);
+ }
+ 
+ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, const uint8_t *ies, size_t length)

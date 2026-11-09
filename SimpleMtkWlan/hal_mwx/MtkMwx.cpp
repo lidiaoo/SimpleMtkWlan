@@ -1805,7 +1805,10 @@ mwx_scan(struct mwx_softc *sc)
 
 	rv = mt7921_mcu_hw_scan(sc, 0);
 	if (rv) {
-		printf("%s: could not initiate scan\n", DEVNAME(sc));
+		/* Expected when the interface is going down (see p20 in
+		 * mt7921_mcu_hw_scan), so this is a device log, not a printf. */
+		MWX_DEV_LOG(sc, "scan not started rv=%d state=%d\n", rv,
+		    ic->ic_state);
 		return rv;
 	}
 
@@ -1914,6 +1917,18 @@ mwx_newstate_task(void *ptr)
 		break;
 	case IEEE80211_S_SCAN:
 		rv = mwx_scan(sc);
+		/*
+		 * PATCH [local-p20]: EBUSY means the interface is on its way
+		 * down and the walk was refused on purpose (see
+		 * mt7921_mcu_hw_scan).  That is not a hardware fault, so it
+		 * must not fall through to mwx_reset() below - resetting the
+		 * chip because of it would turn one teardown into a loop.
+		 * Leave ic_state alone; mwx_init() starts a fresh walk.
+		 */
+		if (rv == EBUSY) {
+			splx(s);
+			return;
+		}
 		if (rv)
 			break;
 		break;
@@ -6070,6 +6085,7 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	int n_ssids = 0;
 	int rv;
 	uint8_t nchan, n_2g = 0, n_5g = 0;
+	unsigned dwell;
 	/*
 	 * DIAG [scan-5g] (local, not upstream): when the request comes from
 	 * AirportWCL it is filtered by the channel bitmap the client sent.
@@ -6078,6 +6094,32 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	 * so the log tells which one it is.
 	 */
 	unsigned avail_5g = 0, skipped_restricted = 0;
+	/*
+	 * PATCH [local-p21]: a scan that names neither an SSID nor a join
+	 * target is the Wi-Fi menu refreshing its list, not a client looking
+	 * for one particular network.  airportd restricts those to the band
+	 * of the current association (measured: 14 channels, restricted=1,
+	 * skipped5g=27) to keep the off-channel excursion short, which is why
+	 * the 5 GHz entries in that menu stay stale.  A full sweep now costs
+	 * the same wall time as that 14-channel request (see the dwell note
+	 * below), so for those scans the bitmap is ignored and every channel
+	 * is walked.  Requests that do name something -- hidden networks,
+	 * join targets -- keep honouring it.
+	 */
+	bool bypass_bitmap = false;
+
+	/*
+	 * PATCH [local-p20]: an interface on its way down (HAL disable ->
+	 * mwx_stop) cannot hold a scan.  Such a request used to be handed to
+	 * the firmware anyway and died with the reset, wasting a scan slot and
+	 * coming back as a bogus complete_channel_num=0 completion.  Refuse
+	 * it here: mwx_newstate_task() leaves ic_state untouched on error and
+	 * mwx_init() re-arms the walk once the hardware is back.
+	 */
+	if ((ic->ic_if.if_flags & IFF_UP) == 0) {
+		MWX_DEV_LOG(sc, "scan request dropped: interface is down\n");
+		return EBUSY;
+	}
 
 	m = mwx_mcu_alloc_msg(sizeof(*req));
 	if (m == NULL)
@@ -6114,6 +6156,29 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 			n_ssids = 1;
 		}
 	}
+
+/*
+	 * PATCH [local-p22]: P21 gated this on scan_type == 1 and on
+	 * ic_des_esslen == 0, and that second half made the whole test dead
+	 * code: ieee80211_set_ess() (node.c) stores the joined SSID's length
+	 * in ic_des_esslen, so on an associated machine it is never zero.
+	 * Measured over 36 sweeps: bypass=0 every single time.
+	 *
+	 * The other half of the test did pass: airportd's restricted
+	 * refreshes arrived as active scans, since they were served at
+	 * dwell 80 -- the value only scan_type 1 selects.  The SSID length
+	 * was therefore the one condition in the way, and it is also why
+	 * 5 GHz showed up in only every other refresh: the 14-channel
+	 * request never touched it.
+	 *
+	 * What identifies a list refresh is that it names no SSID, and the
+	 * bitmap is what blinds such a request to the other band.  So the
+	 * bitmap is ignored for every unnamed request.  Requests that do
+	 * carry an SSID -- hidden networks, join targets -- keep honouring
+	 * it: those are about one network, not about the list.
+	 */
+	if (ic->ic_wcl_scan_requested && ic->ic_wcl_scan_ssid_length == 0)
+		bypass_bitmap = true;
 #endif
 
 #ifdef NOTYET
@@ -6143,7 +6208,8 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 			avail_5g++;
 #ifdef AIRPORT_WCL
 		if (!AirportWCL::scanChannelSelected(ic->ic_wcl_scan_channels,
-		    ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted,
+		    ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted &&
+		    !bypass_bitmap,
 		    ieee80211_mhz2ieee(c->ic_freq, 0))) {
 			if (IEEE80211_IS_CHAN_5GHZ(c))
 				skipped_restricted++;
@@ -6177,9 +6243,37 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	}
 
 	req->channel_type = nchan ? 4 : 0;
-	req->timeout_value = htole16(nchan * 120);
-	req->channel_min_dwell_time = htole16(120);
-	req->channel_dwell_time = htole16(120);
+	/*
+	 * PATCH [local-p20]: a full sweep is the one that gets cut short.
+	 * Measured on this box: 41 channels at 120 ms dwell take 5.4 s
+	 * end-to-end (131 ms per channel including the hop), while airportd
+	 * tears the interface down roughly 4 s after the sweep starts.  The
+	 * channels it never reached are always the 5 GHz tail, because
+	 * ic_channels is populated 2.4 GHz first and the request walks it in
+	 * ascending order.  Shrinking the dwell for large sweeps keeps the
+	 * walk inside that window; client-directed sweeps of a few channels
+	 * (the 14-channel 2.4 GHz and 27-channel 5 GHz requests) are already
+	 * short and keep the conservative value so nothing is missed.
+	 *
+	 * PATCH [local-p21]: measured per channel, the dwell is not what
+	 * sets the price.  A 41-channel sweep at 80 ms costs 91 ms per
+	 * channel (3.75 s), but the 14- and 27-channel refreshes at that
+	 * same 80 ms cost 225-230 ms each (3.22 s / 6.08 s).  The one
+	 * difference between those runs is that the short ones happened
+	 * while the driver held an association, so the walk pays about
+	 * 140 ms per channel extra for it -- roughly one beacon interval,
+	 * i.e. a return to the working channel.  See the scan_func note
+	 * below, which is where that hypothesis is tested.
+	 *
+	 * PATCH [local-p22]: 120 ms is dead weight everywhere, since the
+	 * expensive sweeps were already running at 80.  One value keeps the
+	 * only remaining variable the association penalty, and a full sweep
+	 * costs 41 x 91 ms = 3.7 s once that penalty is gone.
+	 */
+	dwell = 80;
+	req->timeout_value = htole16(nchan * dwell);
+	req->channel_min_dwell_time = htole16(dwell);
+	req->channel_dwell_time = htole16(dwell);
 
 
 #ifdef NOTYET
@@ -6189,10 +6283,45 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 	}
 #endif
 
-	req->scan_func |= SCAN_FUNC_SPLIT_SCAN;
+	/*
+	 * PATCH [local-p22]: SCAN_FUNC_SPLIT_SCAN asks the firmware to break
+	 * the channel list into chunks and come back to the working channel
+	 * between them.  That is affordable for the 14- and 27-channel
+	 * requests airportd used to send, but a 41-channel sweep pays a
+	 * round trip per chunk, and a round trip while associated is the
+	 * only candidate left for the ~140 ms per channel measured above.
+	 * A full-band refresh is one continuous walk, so it runs without
+	 * the flag; small, client-directed sweeps keep it.  The log prints
+	 * scan_func, so the next measurement says whether the flag was the
+	 * cost: sweeps are compared per channel with and without it.
+	 */
+	if (!bypass_bitmap)
+		req->scan_func |= SCAN_FUNC_SPLIT_SCAN;
 
 	/* wildcard BSSID */
 	memset(req->bssid, 0xff, ETHER_ADDR_LEN);
+#ifdef AIRPORT_WCL
+	/*
+	 * PATCH [local-p29]: identify the target of directed (named) scan
+	 * requests.  airportd derives the join-time channel bitmap from its
+	 * per-network records, so a 5 GHz network probed with a 2.4G-only
+	 * bitmap can never be found; the SSID in the log is how that failure
+	 * gets attributed to the right network.
+	 */
+	if (ic->ic_wcl_scan_requested && ic->ic_wcl_scan_ssid_length > 0) {
+		char ssidbuf[IEEE80211_NWID_LEN + 1];
+		unsigned sblen = ic->ic_wcl_scan_ssid_length;
+		if (sblen > IEEE80211_NWID_LEN)
+			sblen = IEEE80211_NWID_LEN;
+		for (unsigned k = 0; k < sblen; ++k) {
+			uint8_t ch = ic->ic_wcl_scan_ssid[k];
+			ssidbuf[k] = (ch >= 0x20 && ch < 0x7f) ? (char)ch : '.';
+		}
+		ssidbuf[sblen] = '\0';
+		MWX_DEV_LOG(sc, "scan target ssid=\"%s\" len=%u\n",
+		    ssidbuf, ic->ic_wcl_scan_ssid_length);
+	}
+#endif
 #ifdef NOTYET
 	if (sreq->flags & NL80211_SCAN_FLAG_RANDOM_ADDR) {
 		get_random_mask_addr(req->random_mac, sreq->mac_addr,
@@ -6202,8 +6331,9 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 #endif
 
 	MWX_DEV_LOG(sc,
-	    "scan request seq=%u channels=%u 2g=%u 5g=%u primary=%u ext=%u timeout=%u dwell=%u min_dwell=%u scan_func=0x%08x ssid_type=0x%x has5g=%d avail5g=%u restricted=%d skipped5g=%u\n",
-	    sc->sc_scan_seq_num, nchan, n_2g, n_5g, req->channels_num,
+	    "scan request seq=%u channels=%u 2g=%u 5g=%u type=%u state=%d primary=%u ext=%u timeout=%u dwell=%u min_dwell=%u scan_func=0x%08x ssid_type=0x%x has5g=%d avail5g=%u restricted=%d bypass=%d skipped5g=%u\n",
+	    sc->sc_scan_seq_num, nchan, n_2g, n_5g, req->scan_type, ic->ic_state,
+	    req->channels_num,
 	    req->ext_channels_num, le16toh(req->timeout_value),
 	    le16toh(req->channel_dwell_time),
 	    le16toh(req->channel_min_dwell_time),
@@ -6214,6 +6344,7 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
 #else
 	    0,
 #endif
+	    bypass_bitmap ? 1 : 0,
 	    skipped_restricted);
 
 	rv = mwx_mcu_send_mbuf(sc, MCU_CE_CMD_START_HW_SCAN, m, NULL);
@@ -8667,6 +8798,17 @@ MtkMwx::disable(IONetworkInterface *interface)
 		return kIOReturnSuccess;
 	}
 	ifp->if_flags &= ~IFF_UP;
+	/*
+	 * PATCH [local-p20]: end an in-flight walk before the hardware goes
+	 * away.  Left running, the firmware carries the scan through the
+	 * reset and answers with a complete_channel_num=0 completion that
+	 * looks like "the band is empty" to the scan layer.  Cancelling here
+	 * keeps the reset clean; mwx_init() starts a fresh walk afterwards.
+	 */
+	if (com->sc_flags & MWX_FLAG_SCANNING) {
+		MWX_DEV_LOG(com, "HAL disable: cancelling running scan\n");
+		mt7921_mcu_hw_scan_cancel(com);
+	}
 	if (ifp->if_flags & IFF_RUNNING)
 		mwx_stop(ifp);
 	MWX_DEV_LOG(com, "HAL disable complete flags=0x%x\n", ifp->if_flags);

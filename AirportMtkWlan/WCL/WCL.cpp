@@ -78,6 +78,15 @@ IOReturn AirportItlwmSkywalkInterface::wclCountryUpdateGated(
 
 bool AirportItlwmSkywalkInterface::initWCL()
 {
+    /*
+     * PATCH [local-p26]: "-mtk-allwifi" publishes the whole candidate tree
+     * instead of the strongest 40.  Presence of the flag is enough; no value
+     * is read from it, matching the "-novht" / "-noht40" convention.
+     */
+    int allwifi = 0;
+    wclPublishAll = PE_parse_boot_argn("-mtk-allwifi", &allwifi, sizeof(allwifi));
+    if (wclPublishAll)
+        XYLog("WCL: -mtk-allwifi set, scan list is not capped\n");
     joinTimer = IOTimerEventSource::timerEventSource(this, wclJoinTimeout);
     if (!joinTimer)
         return false;
@@ -347,6 +356,7 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
             }
             scanPending = false;
             scanCompleted = false;
+            scanQuietWaits = 0;
             wclScanResults = 0;
             scanSource->cancelTimeout();
             ic->ic_wcl_scan_requested = false;
@@ -401,6 +411,7 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
     }
     scanPending = true;
     scanCompleted = false;
+    scanQuietWaits = 0;
     wclScanResults = 0;
     wclScanDeadline = airport_up_time() + 18000;
     scanSkipCompletion = ic->ic_state == IEEE80211_S_SCAN &&
@@ -451,11 +462,25 @@ void AirportItlwmSkywalkInterface::finishWCLScan(IOReturn status)
      * APs from the channel walk.  Reporting success with zero results makes
      * airportd replace its cache with an empty set, which is the "list goes
      * blank for a moment" flicker in the Wi-Fi menu.
+     *
+     * PATCH [local-p23]: the walk no longer publishes each beacon as it
+     * arrives, so the full result set is handed over here in one burst,
+     * strongest signal first.  scanPending has to be cleared before that or
+     * publishWCLBeacon() would only count the nodes again instead of sending
+     * them.
      */
-    if (wclScanResults == 0)
-        publishWCLCachedResults();
     scanPending = false;
+    /*
+     * PATCH [local-p26]: one line per completion.  Two of these for a single
+     * "scan request seq=" means the quiet timer and SCAN_DONE each finished
+     * the walk; the bounded wait in completeWCLScan() should collapse them.
+     */
+    XYLog("WCL scan finish status=0x%x completed=%d results=%u waits=%u "
+        "age=%llums\n", status, scanCompleted, wclScanResults, scanQuietWaits,
+        airport_up_time() - (wclScanDeadline - 18000));
+    publishWCLCachedResults();
     scanCompleted = false;
+    scanQuietWaits = 0;
     wclScanResults = 0;
     scanSource->cancelTimeout();
     fHalService->get80211Controller()->ic_wcl_scan_requested = false;
@@ -474,6 +499,21 @@ void AirportItlwmSkywalkInterface::completeWCLScan()
     if (wclStopping)
         return;
     /*
+     * PATCH [local-p26]: the quiet period can expire while the firmware walk
+     * is still on its last channels -- measured 0.68 s before SCAN_DONE.
+     * Finishing there reported the request twice (a half-swept list first,
+     * then the real one) and made airportd rebuild the menu both times.
+     * Wait briefly for the real event; two 400 ms re-arms cover the measured
+     * gap, and the hard deadline still ends a scan whose SCAN_DONE was
+     * dropped, so nothing can hang.
+     */
+    if (!scanCompleted && scanQuietWaits < 2 &&
+        airport_up_time() + 900 < wclScanDeadline) {
+        ++scanQuietWaits;
+        scanSource->setTimeoutMS(400);
+        return;
+    }
+    /*
      * MT7921 does deliver MCU_EVENT_SCAN_DONE, but it is dropped whenever the
      * walk is started from a settled S_SCAN/S_RUN state or aborted early by a
      * join, so this timer is often the only completion.  IO80211 has already
@@ -486,11 +526,130 @@ void AirportItlwmSkywalkInterface::completeWCLScan()
                                                     : kIOReturnTimeout);
 }
 
+/*
+ * PATCH [local-p25]: rebuild the information elements the way a real beacon
+ * carries them.
+ *
+ * The node keeps parsed state rather than the raw frame, so the cache dump
+ * used to re-serialise only the SSID and the RSN element.  Every entry then
+ * reached airportd without a rate set, without DS parameters and without any
+ * HT/VHT capability -- which shows up as "PHY Mode: None" in system_profiler.
+ *
+ * The visible cost was in the scan cache.  airportd splits a sweep into a
+ * 2.4 GHz subset and a 5 GHz one; the 2.4 GHz half answered from cache
+ * ("Successful cache-assisted"), but the 5 GHz half failed that test on every
+ * pass and had to be scanned again, so the menu alternated between a
+ * 2.4 GHz-only list and the full one.  A 5 GHz BSS is only allowed to be
+ * 802.11n or better, hence the suspicion that airportd was refusing to cache
+ * the 5 GHz entries for lack of the HT/VHT elements.
+ *
+ * Everything here comes out of the node itself (ieee80211_parse_htcap() and
+ * friends filled it from the real frame), so the result describes the AP and
+ * not this adapter.  A caller-visible rate set is included because airportd
+ * derives the PHY mode from it.
+ */
+static size_t
+wclBuildBeaconIEs(ieee80211com *ic, const struct ieee80211_node *ni,
+    uint8_t *buf, size_t bufsize)
+{
+    uint8_t *frm = buf;
+    uint8_t *limit = buf + bufsize - 64;    /* room for the RSN element */
+    unsigned channel = ieee80211_chan2ieee(ic, ni->ni_chan);
+
+    if (limit < buf || ni->ni_esslen > 32)
+        return 0;
+
+    frm = ieee80211_add_ssid(frm, ni->ni_essid, ni->ni_esslen);
+    if (frm > limit)
+        return 0;
+
+    if (ni->ni_rates.rs_nrates > 0) {
+        frm = ieee80211_add_rates(frm, &ni->ni_rates);
+        if (ni->ni_rates.rs_nrates > IEEE80211_RATE_SIZE)
+            frm = ieee80211_add_xrates(frm, &ni->ni_rates);
+        if (frm > limit)
+            return 0;
+    }
+
+    /*
+     * PATCH [local-p29]: DS Params exists only in 2.4 GHz beacons; a real
+     * 5 GHz beacon never carries it.  Emitting it for 5 GHz nodes produced
+     * a malformed beacon and gave airportd a channel record that names a
+     * 5 GHz channel inside a 2.4G-only element -- the kind of mismatch that
+     * ends up in known-network profiles and later steers join-time directed
+     * scans at the wrong band.
+     */
+    if (IEEE80211_IS_CHAN_2GHZ(ni->ni_chan)) {
+        *frm++ = IEEE80211_ELEMID_DSPARMS;
+        *frm++ = 1;
+        *frm++ = uint8_t(channel);
+        if (frm > limit)
+            return 0;
+    }
+
+    if (ni->ni_flags & IEEE80211_NODE_HTCAP) {
+        *frm++ = IEEE80211_ELEMID_HTCAPS;
+        *frm++ = 26;
+        LE_WRITE_2(frm, ni->ni_htcaps); frm += 2;
+        *frm++ = ni->ni_ampdu_param;
+        memcpy(frm, ni->ni_rxmcs, 10); frm += 10;
+        LE_WRITE_2(frm, ni->ni_max_rxrate & IEEE80211_MCS_RX_RATE_HIGH);
+        frm += 2;
+        *frm++ = ni->ni_tx_mcs_set;
+        *frm++ = 0; *frm++ = 0; *frm++ = 0;
+        LE_WRITE_2(frm, ni->ni_htxcaps); frm += 2;
+        LE_WRITE_4(frm, ni->ni_txbfcaps); frm += 4;
+        *frm++ = ni->ni_aselcaps;
+        if (frm > limit)
+            return 0;
+
+        *frm++ = IEEE80211_ELEMID_HTOP;
+        *frm++ = 22;
+        *frm++ = ni->ni_primary_chan ? ni->ni_primary_chan
+                                    : uint8_t(channel);
+        *frm++ = ni->ni_htop0;
+        LE_WRITE_2(frm, ni->ni_htop1); frm += 2;
+        LE_WRITE_2(frm, ni->ni_htop2); frm += 2;
+        memset(frm, 0, 16); frm += 16;
+        if (frm > limit)
+            return 0;
+    }
+
+    if (ni->ni_flags & IEEE80211_NODE_VHTCAP) {
+        *frm++ = IEEE80211_ELEMID_VHT_CAP;
+        *frm++ = 12;
+        LE_WRITE_4(frm, ni->ni_vhtcaps); frm += 4;
+        LE_WRITE_2(frm, ni->ni_vht_mcsinfo.rx_mcs_map); frm += 2;
+        LE_WRITE_2(frm, ni->ni_vht_mcsinfo.rx_highest); frm += 2;
+        LE_WRITE_2(frm, ni->ni_vht_mcsinfo.tx_mcs_map); frm += 2;
+        LE_WRITE_2(frm, ni->ni_vht_mcsinfo.tx_highest); frm += 2;
+        if (frm > limit)
+            return 0;
+
+        *frm++ = IEEE80211_ELEMID_VHT_OPMODE;
+        *frm++ = 5;
+        *frm++ = ni->ni_vht_chanwidth;
+        *frm++ = ni->ni_vht_chan1 ? ni->ni_vht_chan1 : uint8_t(channel);
+        *frm++ = ni->ni_vht_chan2;
+        LE_WRITE_2(frm, ni->ni_vht_basicmcs); frm += 2;
+        if (frm > limit)
+            return 0;
+    }
+
+    if (ni->ni_rsnprotos != 0) {
+        frm = ieee80211_add_rsn(frm, ic, ni);
+        if (frm > buf + bufsize)
+            return 0;
+    }
+
+    return size_t(frm - buf);
+}
+
 void AirportItlwmSkywalkInterface::publishWCLCachedResults()
 {
     ieee80211com *ic = fHalService->get80211Controller();
     struct ieee80211_node *ni;
-    uint32_t nodes = 0;
+    uint32_t nodes = 0, n2g = 0, n5g = 0;
 
     /*
      * Events only publish beacons that arrive while the scan is running.  A
@@ -501,19 +660,103 @@ void AirportItlwmSkywalkInterface::publishWCLCachedResults()
      * RSN IEs from the node (the node keeps parsed state, not the raw frame)
      * and hand every candidate over before ScanDone.
      */
+    /*
+     * PATCH [local-p23]: two things made the menu list feel arbitrary and
+     * jumpy.
+     *
+     * 1. The walk published every beacon from publishWCLBeacon() the moment
+     *    it arrived, i.e. in channel order.  preinit() fills 2.4 GHz first,
+     *    so the list was always built weak-2.4-first and the strong 5 GHz APs
+     *    landed at the bottom -- exactly "the one with good signal is last".
+     *    It also meant 120-156 separate ScanResult messages spread over the
+     *    5.7 s walk, so any list opened mid-scan was rebuilt under the
+     *    cursor.  Collection is now deferred to finishWCLScan() and sorted
+     *    by RSSI, so the menu sees one burst per scan, strongest first.
+     *
+     * 2. The 96 node cap was applied in BSSID order -- the tree's own order
+     *    -- and ic_tree holds ~200 nodes on this machine.  Every AP whose
+     *    BSSID sorted past the cap was invisible no matter how strong it
+     *    was.  The whole tree is published now.
+     */
+    struct ieee80211_node *list[512];
     RB_FOREACH(ni, ieee80211_tree, &ic->ic_tree) {
-        if (nodes >= 96)
+        if (nodes >= sizeof(list) / sizeof(list[0]))
             break;
-        uint8_t ies[256];
-        uint8_t *frm = ies;
-        frm = ieee80211_add_ssid(frm, ni->ni_essid, ni->ni_esslen);
-        if (ni->ni_rsnprotos != 0)
-            frm = ieee80211_add_rsn(frm, ic, ni);
-        publishWCLBeacon(ni, ies, size_t(frm - ies));
-        ++nodes;
+        if (ni->ni_esslen > 32)
+            continue;
+        if (!ni->ni_chan || ni->ni_chan == IEEE80211_CHAN_ANYC)
+            continue;
+        if (IEEE80211_IS_CHAN_5GHZ(ni->ni_chan))
+            ++n5g;
+        else
+            ++n2g;
+        list[nodes++] = ni;
     }
-    XYLog("publishWCLCachedResults nodes=%u published=%u\n", nodes,
-        wclScanResults);
+    /* Insertion sort, strongest first; nodes <= 512 so O(n^2) is cheap. */
+    for (unsigned i = 1; i < nodes; ++i) {
+        struct ieee80211_node *key = list[i];
+        unsigned j = i;
+        while (j > 0 && list[j - 1]->ni_rssi < key->ni_rssi) {
+            list[j] = list[j - 1];
+            --j;
+        }
+        list[j] = key;
+    }
+    /*
+     * PATCH [local-p27]: hand the panel a short list.  The tree holds 200+
+     * candidates in a dense neighbourhood and the menu became unreadable
+     * ("138 networks, can't even browse them").  Everything past the cap is
+     * too weak to join anyway; the associated BSSID is pinned to the last
+     * slot so airportd never loses sight of the current network.
+     */
+    const uint32_t wclPublishCap = 40;
+    if (!wclPublishAll && nodes > wclPublishCap) {
+        struct ieee80211_node *keep =
+            (assocNotified && ic->ic_bss) ? ic->ic_bss : nullptr;
+        if (keep) {
+            for (unsigned i = wclPublishCap; i < nodes; ++i)
+                if (list[i] == keep) {
+                    list[wclPublishCap - 1] = keep;
+                    break;
+                }
+        }
+        nodes = wclPublishCap;
+    }
+    unsigned logged = 0, skipped = 0, sent = 0;
+    /*
+     * PATCH [local-p27]: the batch itself goes through publishWCLBeacon(),
+     * whose live-post gate must not swallow it (it ran with scanPending
+     * already false, which is exactly the state the gate blocks).  Latch a
+     * flag for the duration of the loop.
+     */
+    wclBatchPublishing = true;
+    for (unsigned i = 0; i < nodes; ++i) {
+        /*
+         * PATCH [local-p25]: hand over a beacon-shaped element list instead
+         * of SSID + RSN only.  See wclBuildBeaconIEs().
+         */
+        uint8_t ies[320];
+        size_t length = wclBuildBeaconIEs(ic, list[i], ies, sizeof(ies));
+        if (length == 0) {
+            ++skipped;
+            continue;
+        }
+        if (logged < 4 && IEEE80211_IS_CHAN_5GHZ(list[i]->ni_chan)) {
+            XYLog("p25 5g sample ch=%u rssi=%d ies=%zu rates=%u ht=%d vht=%d\n",
+                ieee80211_chan2ieee(ic, list[i]->ni_chan),
+                IWM_MIN_DBM + list[i]->ni_rssi, length,
+                list[i]->ni_rates.rs_nrates,
+                (list[i]->ni_flags & IEEE80211_NODE_HTCAP) != 0,
+                (list[i]->ni_flags & IEEE80211_NODE_VHTCAP) != 0);
+            ++logged;
+        }
+        publishWCLBeacon(list[i], ies, length);
+        ++sent;
+    }
+    wclBatchPublishing = false;
+    XYLog("publishWCLCachedResults nodes=%u cap=%u sent=%u 2g=%u 5g=%u "
+        "skipped=%u maxnodes=%d\n", nodes, wclPublishAll ? 0 : wclPublishCap,
+        sent, n2g, n5g, skipped, ic->ic_max_nnodes);
 }
 
 void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, const uint8_t *ies, size_t length)
@@ -561,6 +804,30 @@ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, 
          */
         if (airport_up_time() < wclScanDeadline)
             scanSource->setTimeoutMS(1200);
+        /*
+         * PATCH [local-p23]: collect during the walk, publish afterwards.
+         * Sending here meant one message per beacon in channel order, which
+         * both kept rebuilding the menu mid-scan and put the strong 5 GHz
+         * APs last.  finishWCLScan() now emits the sorted set in one burst.
+         */
+        IOFree(metadata, size);
+        return;
+    }
+    /*
+     * PATCH [local-p27]: live per-beacon ScanResult posts are the leak behind
+     * "sometimes 40, sometimes the full list".  The driver capped its batch
+     * at 40, yet airportd kept 170-190 cached entries -- fed by this path:
+     * when unassociated the net80211 stack sits in S_SCAN rotating channels
+     * with scanPending false, so every beacon fell through to a live,
+     * uncapped post, and airportd merges without evicting.  The batch from
+     * publishWCLCachedResults() (flagged by wclBatchPublishing) is now the
+     * ONLY source of scan results.  "-mtk-allwifi" restores the legacy live
+     * stream; the associated BSS stays exempt so the join flow keeps updates.
+     */
+    if (!wclBatchPublishing && !wclPublishAll &&
+        !(assocNotified && IEEE80211_ADDR_EQ(node->ni_bssid, joinBSSID))) {
+        IOFree(metadata, size);
+        return;
     }
     instance->postMessage(this, AirportWCL::ScanResult, metadata, messageSize, true);
     IOFree(metadata, size);
@@ -921,6 +1188,17 @@ void AirportItlwmSkywalkInterface::finishWCLJoin(uint16_t status, uint16_t reaso
             ieee80211_new_state(ic, IEEE80211_S_INIT, -1);
         }
     } else {
+        /*
+         * PATCH [local-p28]: end the join session on success too.  Leaving
+         * ic_wcl_join_requested set after a completed join let the net80211
+         * state machine re-match the stale desired ESS out of the node tree
+         * after any power cycle or beacon loss -- an association airportd
+         * never asked for and never learned about ("zombie"): its UI showed
+         * disconnected, its live scans got rejected busy and every join by
+         * name failed with "Could not find network".  macOS owns joins; a
+         * reconnect after a drop must come from airportd as a fresh request.
+         */
+        fHalService->get80211Controller()->ic_wcl_join_requested = false;
         /* PATCH [local-p18]: the key is live again, so a later zero-PSK
          * report is a genuine fault and must not be suppressed. */
         fHalService->get80211Controller()->ic_wcl_psk_wiped = false;

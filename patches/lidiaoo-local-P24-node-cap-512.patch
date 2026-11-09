@@ -1,0 +1,93 @@
+diff --git a/AirportMtkWlan/WCL/WCL.cpp b/AirportMtkWlan/WCL/WCL.cpp
+diff --git a/mtk80211/openbsd/net80211/ieee80211.c b/mtk80211/openbsd/net80211/ieee80211.c
+--- a/AirportMtkWlan/WCL/WCL.cpp
++++ b/AirportMtkWlan/WCL/WCL.cpp
+@@ -495,7 +495,7 @@
+ {
+     ieee80211com *ic = fHalService->get80211Controller();
+     struct ieee80211_node *ni;
+-    uint32_t nodes = 0;
++    uint32_t nodes = 0, n2g = 0, n5g = 0;
+ 
+     /*
+      * Events only publish beacons that arrive while the scan is running.  A
+@@ -524,7 +524,7 @@
+      *    BSSID sorted past the cap was invisible no matter how strong it
+      *    was.  The whole tree is published now.
+      */
+-    struct ieee80211_node *list[256];
++    struct ieee80211_node *list[512];
+     RB_FOREACH(ni, ieee80211_tree, &ic->ic_tree) {
+         if (nodes >= sizeof(list) / sizeof(list[0]))
+             break;
+@@ -532,9 +532,13 @@
+             continue;
+         if (!ni->ni_chan || ni->ni_chan == IEEE80211_CHAN_ANYC)
+             continue;
++        if (IEEE80211_IS_CHAN_5GHZ(ni->ni_chan))
++            ++n5g;
++        else
++            ++n2g;
+         list[nodes++] = ni;
+     }
+-    /* Insertion sort, strongest first; nodes <= 256 so O(n^2) is cheap. */
++    /* Insertion sort, strongest first; nodes <= 512 so O(n^2) is cheap. */
+     for (unsigned i = 1; i < nodes; ++i) {
+         struct ieee80211_node *key = list[i];
+         unsigned j = i;
+@@ -544,16 +548,29 @@
+         }
+         list[j] = key;
+     }
++    unsigned logged = 0;
+     for (unsigned i = 0; i < nodes; ++i) {
+         uint8_t ies[256];
+         uint8_t *frm = ies;
+         frm = ieee80211_add_ssid(frm, list[i]->ni_essid, list[i]->ni_esslen);
+         if (list[i]->ni_rsnprotos != 0)
+             frm = ieee80211_add_rsn(frm, ic, list[i]);
++        /*
++         * PATCH [local-p24]: the strongest 5 GHz entries are logged so the
++         * node table cap (200, see ieee80211_cache_size) can be told apart
++         * from a WCL-side rejection without another rebuild.
++         */
++        if (logged < 4 && IEEE80211_IS_CHAN_5GHZ(list[i]->ni_chan)) {
++            XYLog("p24 5g sample ch=%u rssi=%d esslen=%u ies=%zu\n",
++                ieee80211_chan2ieee(ic, list[i]->ni_chan),
++                IWM_MIN_DBM + list[i]->ni_rssi, list[i]->ni_esslen,
++                size_t(frm - ies));
++            ++logged;
++        }
+         publishWCLBeacon(list[i], ies, size_t(frm - ies));
+     }
+-    XYLog("publishWCLCachedResults nodes=%u published=%u\n", nodes,
+-        wclScanResults);
++    XYLog("publishWCLCachedResults nodes=%u 2g=%u 5g=%u published=%u "
++        "maxnodes=%d\n", nodes, n2g, n5g, wclScanResults, ic->ic_max_nnodes);
+ }
+ 
+ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, const uint8_t *ies, size_t length)
+--- a/mtk80211/openbsd/net80211/ieee80211.c
++++ b/mtk80211/openbsd/net80211/ieee80211.c
+@@ -93,7 +93,20 @@
+ };
+ ///
+ 
+-int ieee80211_cache_size = IEEE80211_CACHE_SIZE;
++/*
++ * PATCH [local-p24]: the node cache was capped at IEEE80211_CACHE_SIZE
++ * (200) and a dense neighbourhood fills that with 2.4 GHz APs alone,
++ * because preinit() lists 2.4 GHz first and a scan walks in order.  Once
++ * ieee80211_alloc_node_helper() is out of slots, ieee80211_dup_bss()
++ * returns NULL and ieee80211_find_rxnode() falls back to ic_bss, so every
++ * 5 GHz beacon is absorbed by the working node instead of creating one of
++ * its own.  The result is a Wi-Fi list that never contains a single 5 GHz
++ * network even though the sweep reports all 41 channels complete --
++ * measured: nodes_before=200 on every scan, 0 of 69 cached results on
++ * 5 GHz.  The ESS cap in ieee80211_set_ess() keeps using the 200 macro;
++ * only the node table grows.
++ */
++int ieee80211_cache_size = 512;
+ 
+ void ieee80211_setbasicrates(struct ieee80211com *);
+ int ieee80211_findrate(struct ieee80211com *, enum ieee80211_phymode, int);

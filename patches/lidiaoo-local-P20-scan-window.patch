@@ -1,0 +1,107 @@
+diff --git a/SimpleMtkWlan/hal_mwx/MtkMwx.cpp b/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
+index 16fdaa1..eca874b 100644
+--- a/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
++++ b/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
+@@ -1805,7 +1805,10 @@ mwx_scan(struct mwx_softc *sc)
+ 
+ 	rv = mt7921_mcu_hw_scan(sc, 0);
+ 	if (rv) {
+-		printf("%s: could not initiate scan\n", DEVNAME(sc));
++		/* Expected when the interface is going down (see p20 in
++		 * mt7921_mcu_hw_scan), so this is a device log, not a printf. */
++		MWX_DEV_LOG(sc, "scan not started rv=%d state=%d\n", rv,
++		    ic->ic_state);
+ 		return rv;
+ 	}
+ 
+@@ -1914,6 +1917,18 @@ mwx_newstate_task(void *ptr)
+ 		break;
+ 	case IEEE80211_S_SCAN:
+ 		rv = mwx_scan(sc);
++		/*
++		 * PATCH [local-p20]: EBUSY means the interface is on its way
++		 * down and the walk was refused on purpose (see
++		 * mt7921_mcu_hw_scan).  That is not a hardware fault, so it
++		 * must not fall through to mwx_reset() below - resetting the
++		 * chip because of it would turn one teardown into a loop.
++		 * Leave ic_state alone; mwx_init() starts a fresh walk.
++		 */
++		if (rv == EBUSY) {
++			splx(s);
++			return;
++		}
+ 		if (rv)
+ 			break;
+ 		break;
+@@ -6070,6 +6085,7 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
+ 	int n_ssids = 0;
+ 	int rv;
+ 	uint8_t nchan, n_2g = 0, n_5g = 0;
++	unsigned dwell;
+ 	/*
+ 	 * DIAG [scan-5g] (local, not upstream): when the request comes from
+ 	 * AirportWCL it is filtered by the channel bitmap the client sent.
+@@ -6079,6 +6095,19 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
+ 	 */
+ 	unsigned avail_5g = 0, skipped_restricted = 0;
+ 
++	/*
++	 * PATCH [local-p20]: an interface on its way down (HAL disable ->
++	 * mwx_stop) cannot hold a scan.  Such a request used to be handed to
++	 * the firmware anyway and died with the reset, wasting a scan slot and
++	 * coming back as a bogus complete_channel_num=0 completion.  Refuse
++	 * it here: mwx_newstate_task() leaves ic_state untouched on error and
++	 * mwx_init() re-arms the walk once the hardware is back.
++	 */
++	if ((ic->ic_if.if_flags & IFF_UP) == 0) {
++		MWX_DEV_LOG(sc, "scan request dropped: interface is down\n");
++		return EBUSY;
++	}
++
+ 	m = mwx_mcu_alloc_msg(sizeof(*req));
+ 	if (m == NULL)
+ 		return ENOMEM;
+@@ -6177,9 +6206,22 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
+ 	}
+ 
+ 	req->channel_type = nchan ? 4 : 0;
+-	req->timeout_value = htole16(nchan * 120);
+-	req->channel_min_dwell_time = htole16(120);
+-	req->channel_dwell_time = htole16(120);
++	/*
++	 * PATCH [local-p20]: a full sweep is the one that gets cut short.
++	 * Measured on this box: 41 channels at 120 ms dwell take 5.4 s
++	 * end-to-end (131 ms per channel including the hop), while airportd
++	 * tears the interface down roughly 4 s after the sweep starts.  The
++	 * channels it never reached are always the 5 GHz tail, because
++	 * ic_channels is populated 2.4 GHz first and the request walks it in
++	 * ascending order.  Shrinking the dwell for large sweeps keeps the
++	 * walk inside that window; client-directed sweeps of a few channels
++	 * (the 14-channel 2.4 GHz and 27-channel 5 GHz requests) are already
++	 * short and keep the conservative value so nothing is missed.
++	 */
++	dwell = nchan > 32 ? 80 : 120;
++	req->timeout_value = htole16(nchan * dwell);
++	req->channel_min_dwell_time = htole16(dwell);
++	req->channel_dwell_time = htole16(dwell);
+ 
+ 
+ #ifdef NOTYET
+@@ -8667,6 +8709,17 @@ MtkMwx::disable(IONetworkInterface *interface)
+ 		return kIOReturnSuccess;
+ 	}
+ 	ifp->if_flags &= ~IFF_UP;
++	/*
++	 * PATCH [local-p20]: end an in-flight walk before the hardware goes
++	 * away.  Left running, the firmware carries the scan through the
++	 * reset and answers with a complete_channel_num=0 completion that
++	 * looks like "the band is empty" to the scan layer.  Cancelling here
++	 * keeps the reset clean; mwx_init() starts a fresh walk afterwards.
++	 */
++	if (com->sc_flags & MWX_FLAG_SCANNING) {
++		MWX_DEV_LOG(com, "HAL disable: cancelling running scan\n");
++		mt7921_mcu_hw_scan_cancel(com);
++	}
+ 	if (ifp->if_flags & IFF_RUNNING)
+ 		mwx_stop(ifp);
+ 	MWX_DEV_LOG(com, "HAL disable complete flags=0x%x\n", ifp->if_flags);

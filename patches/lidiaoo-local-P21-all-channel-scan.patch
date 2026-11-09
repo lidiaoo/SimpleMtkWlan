@@ -1,0 +1,93 @@
+diff --git a/SimpleMtkWlan/hal_mwx/MtkMwx.cpp b/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
+index eca874b..bd81931 100644
+--- a/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
++++ b/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
+@@ -6094,6 +6094,19 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
+ 	 * so the log tells which one it is.
+ 	 */
+ 	unsigned avail_5g = 0, skipped_restricted = 0;
++	/*
++	 * PATCH [local-p21]: a scan that names neither an SSID nor a join
++	 * target is the Wi-Fi menu refreshing its list, not a client looking
++	 * for one particular network.  airportd restricts those to the band
++	 * of the current association (measured: 14 channels, restricted=1,
++	 * skipped5g=27) to keep the off-channel excursion short, which is why
++	 * the 5 GHz entries in that menu stay stale.  A full sweep now costs
++	 * the same wall time as that 14-channel request (see the dwell note
++	 * below), so for those scans the bitmap is ignored and every channel
++	 * is walked.  Requests that do name something -- hidden networks,
++	 * join targets -- keep honouring it.
++	 */
++	bool bypass_bitmap = false;
+ 
+ 	/*
+ 	 * PATCH [local-p20]: an interface on its way down (HAL disable ->
+@@ -6143,6 +6156,18 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
+ 			n_ssids = 1;
+ 		}
+ 	}
++
++	/*
++	 * PATCH [local-p21]: only an active, unnamed scan is the list
++	 * refresh described above.  Passive sweeps are left alone: they have
++	 * to sit on each channel long enough to catch a beacon, so walking
++	 * all 41 of them would take far longer than airportd is willing to
++	 * wait.  ic_des_esslen covers the join path, which reaches this
++	 * function with the target SSID already set.
++	 */
++	if (ic->ic_wcl_scan_requested && req->scan_type == 1 &&
++	    ic->ic_wcl_scan_ssid_length == 0 && ic->ic_des_esslen == 0)
++		bypass_bitmap = true;
+ #endif
+ 
+ #ifdef NOTYET
+@@ -6172,7 +6197,8 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
+ 			avail_5g++;
+ #ifdef AIRPORT_WCL
+ 		if (!AirportWCL::scanChannelSelected(ic->ic_wcl_scan_channels,
+-		    ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted,
++		    ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted &&
++		    !bypass_bitmap,
+ 		    ieee80211_mhz2ieee(c->ic_freq, 0))) {
+ 			if (IEEE80211_IS_CHAN_5GHZ(c))
+ 				skipped_restricted++;
+@@ -6217,8 +6243,21 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
+ 	 * walk inside that window; client-directed sweeps of a few channels
+ 	 * (the 14-channel 2.4 GHz and 27-channel 5 GHz requests) are already
+ 	 * short and keep the conservative value so nothing is missed.
++	 *
++	 * PATCH [local-p21]: that last assumption was wrong, and the dwell
++	 * turns out to matter far more per channel than it looks.  Measured
++	 * over 11 sweeps: 14 and 27 channels at 120 ms dwell cost 266-267 ms
++	 * each (3.74 s and 7.17 s), i.e. dwell + ~146 ms, while 41 channels
++	 * at 80 ms cost 91 ms each (3.74 s), i.e. dwell + ~11 ms.  The step
++	 * sits at the 100 ms beacon interval: at or above it the firmware
++	 * appears to wait for a beacon on top of the dwell, below it the
++	 * probe response is enough.  Active probing therefore always runs at
++	 * 80 ms -- a probe response comes back within a few ms -- which lets
++	 * every channel count be swept in the time 14 channels used to take.
++	 * Passive scans keep 120 ms because they have to outlast a beacon
++	 * interval to hear anything at all.
+ 	 */
+-	dwell = nchan > 32 ? 80 : 120;
++	dwell = (nchan > 32 || req->scan_type == 1) ? 80 : 120;
+ 	req->timeout_value = htole16(nchan * dwell);
+ 	req->channel_min_dwell_time = htole16(dwell);
+ 	req->channel_dwell_time = htole16(dwell);
+@@ -6244,7 +6283,7 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
+ #endif
+ 
+ 	MWX_DEV_LOG(sc,
+-	    "scan request seq=%u channels=%u 2g=%u 5g=%u primary=%u ext=%u timeout=%u dwell=%u min_dwell=%u scan_func=0x%08x ssid_type=0x%x has5g=%d avail5g=%u restricted=%d skipped5g=%u\n",
++	    "scan request seq=%u channels=%u 2g=%u 5g=%u primary=%u ext=%u timeout=%u dwell=%u min_dwell=%u scan_func=0x%08x ssid_type=0x%x has5g=%d avail5g=%u restricted=%d bypass=%d skipped5g=%u\n",
+ 	    sc->sc_scan_seq_num, nchan, n_2g, n_5g, req->channels_num,
+ 	    req->ext_channels_num, le16toh(req->timeout_value),
+ 	    le16toh(req->channel_dwell_time),
+@@ -6256,6 +6295,7 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
+ #else
+ 	    0,
+ #endif
++	    bypass_bitmap ? 1 : 0,
+ 	    skipped_restricted);
+ 
+ 	rv = mwx_mcu_send_mbuf(sc, MCU_CE_CMD_START_HW_SCAN, m, NULL);

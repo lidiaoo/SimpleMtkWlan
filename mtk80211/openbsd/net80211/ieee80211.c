@@ -93,7 +93,20 @@ int _start(struct kmod_info*, void*) {
 };
 ///
 
-int ieee80211_cache_size = IEEE80211_CACHE_SIZE;
+/*
+ * PATCH [local-p24]: the node cache was capped at IEEE80211_CACHE_SIZE
+ * (200) and a dense neighbourhood fills that with 2.4 GHz APs alone,
+ * because preinit() lists 2.4 GHz first and a scan walks in order.  Once
+ * ieee80211_alloc_node_helper() is out of slots, ieee80211_dup_bss()
+ * returns NULL and ieee80211_find_rxnode() falls back to ic_bss, so every
+ * 5 GHz beacon is absorbed by the working node instead of creating one of
+ * its own.  The result is a Wi-Fi list that never contains a single 5 GHz
+ * network even though the sweep reports all 41 channels complete --
+ * measured: nodes_before=200 on every scan, 0 of 69 cached results on
+ * 5 GHz.  The ESS cap in ieee80211_set_ess() keeps using the 200 macro;
+ * only the node table grows.
+ */
+int ieee80211_cache_size = 512;
 
 void ieee80211_setbasicrates(struct ieee80211com *);
 int ieee80211_findrate(struct ieee80211com *, enum ieee80211_phymode, int);

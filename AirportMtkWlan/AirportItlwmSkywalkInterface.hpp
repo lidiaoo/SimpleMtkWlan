@@ -461,6 +461,27 @@ private:
     bool scanPending;
     bool scanCompleted;
     bool scanSkipCompletion;
+    /*
+     * PATCH [local-p26]: the quiet-period timer can expire before the MCU
+     * reports SCAN_DONE, which completed one request twice and reported the
+     * list from a half-swept walk.  Counts the bounded re-arms spent waiting
+     * for the real completion, so a dropped event still ends the scan.
+     */
+    uint32_t scanQuietWaits = 0;
+    /*
+     * PATCH [local-p26]: "-mtk-allwifi" lifts the publish cap so the panel
+     * lists every candidate in the tree, not just the strongest 40.
+     * PATCH [local-p27]: it also re-enables the legacy live per-beacon
+     * ScanResult stream; without it the batch is the only source.
+     */
+    bool wclPublishAll = false;
+    /*
+     * PATCH [local-p27]: latched for the duration of the
+     * publishWCLCachedResults() loop -- the batch itself dispatches through
+     * publishWCLBeacon(), which must stay open for it while everything else
+     * live is gated off.
+     */
+    bool wclBatchPublishing = false;
     bool wclBssValid;
     bool wclLinkIndicated;
     uint8_t wclBssInfo[sizeof(AirportWCL::BeaconMetadata) + 0x800];

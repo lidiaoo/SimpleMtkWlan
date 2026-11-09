@@ -1,0 +1,1299 @@
+diff --git a/AirportMtkWlan/AirportItlwmSkywalkInterface.hpp b/AirportMtkWlan/AirportItlwmSkywalkInterface.hpp
+index 71a801f..3c24a7c 100644
+--- a/AirportMtkWlan/AirportItlwmSkywalkInterface.hpp
++++ b/AirportMtkWlan/AirportItlwmSkywalkInterface.hpp
+@@ -449,6 +449,13 @@ private:
+     void finishWCLScan(IOReturn);
+     void finishWCLJoin(uint16_t, uint16_t, IOReturn);
+     void publishWCLBeacon(const ieee80211_node *, const uint8_t *, size_t);
++    /*
++     * IO80211 only learns about networks through the ScanResult messages we
++     * post; the driver's own node tree is not read by the framework.  When a
++     * scan window closes without a single beacon event the tree may still hold
++     * every AP of the channel walk, so flush it before reporting completion.
++     */
++    void publishWCLCachedResults();
+     IOTimerEventSource *joinTimer;
+     uint8_t joinBSSID[6];
+     bool scanPending;
+@@ -461,6 +468,13 @@ private:
+     uint32_t wclAssociatedBeacons = 0;
+     uint32_t wclLqmBeacons = 0;
+     uint32_t wclLqmReportedBeacons = 0;
++    /*
++     * Beacons accepted for the in-flight WCL scan, and the hard deadline
++     * (in airport_up_time() ms) after which quiet-period completion stops
++     * being deferred.
++     */
++    uint32_t wclScanResults = 0;
++    uint64_t wclScanDeadline = 0;
+     int wclReportedLinkQuality = -2;
+     ifnet_t wclLinkQualityInterface = nullptr;
+     bool joinPending;
+diff --git a/AirportMtkWlan/WCL/WCL.cpp b/AirportMtkWlan/WCL/WCL.cpp
+index 742bd29..01b1fb1 100644
+--- a/AirportMtkWlan/WCL/WCL.cpp
++++ b/AirportMtkWlan/WCL/WCL.cpp
+@@ -188,7 +188,10 @@ IOReturn AirportItlwmSkywalkInterface::wclCommand(OSObject *, void *a0, void *a1
+         case 0: return self->beginWCLScan(static_cast<apple80211ScanRequest *>(a2));
+         case 1: return self->beginWCLJoin(static_cast<apple80211AssocCandidates *>(a2));
+         case 2: return self->abortWCLJoin();
+-        case 3: return self->leaveWCLNetwork();
++        case 3:
++            XYLog("WCL leave: airportd leaveNetwork cmd (state=%d)\n",
++                  self->fHalService->get80211Controller()->ic_state);
++            return self->leaveWCLNetwork();
+         case 6: return self->copyWCLExtendedBss(a2);
+         case 7:
+             if (!a2 || !self->wclBssValid || !self->wclAssociatedBeacons)
+@@ -262,13 +265,131 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
+     AirportWCL::ScanRequest scan;
+     if (!AirportWCL::decodeScan(request, 0x1550, scan))
+         return kIOReturnBadArgument;
++    /*
++     * DIAG [scan-5g] (local, not upstream): mt7921_mcu_hw_scan reports
++     * "2g=14 5g=0" even when the adapter runs on a 5 GHz network, so the
++     * "Other networks" list only ever shows 2.4 GHz. The bitmap we hand
++     * to the HAL is built by decodeScan(), which drops entries on three
++     * guessed flag rules. Dump the raw apple80211_channel list for the
++     * first few requests so the real flag encoding can be read off the
++     * machine instead of guessed. Pure logging: no behaviour change.
++     */
++    {
++        static unsigned diagScans;
++
++        if (diagScans < 6 && scan.channelCount) {
++            const uint8_t *raw =
++                reinterpret_cast<const uint8_t *>(request);
++            unsigned kept = 0, drop6g = 0, dropBand = 0, dropRange = 0;
++
++            for (uint32_t i = 0; i < scan.channelCount; ++i) {
++                const uint8_t *entry = raw + 0x58 + size_t(i) * 12;
++                uint32_t channel = AirportWCL::read32(entry + 4);
++                uint32_t flags = AirportWCL::read32(entry + 8);
++
++                if (!channel || channel > 196) {
++                    dropRange++;
++                    continue;
++                }
++                if (flags & 0x2000) {
++                    drop6g++;
++                    continue;
++                }
++                if (((flags & 0x8) && channel > 14) ||
++                    ((flags & 0x10) && channel <= 14)) {
++                    dropBand++;
++                    continue;
++                }
++                kept++;
++            }
++            XYLog("WCL scan diag count=%u type=%u ssidLen=%u kept=%u "
++                "dropRange=%u drop6g=%u dropBand=%u bm=%02x%02x%02x%02x\n",
++                scan.channelCount, scan.type, scan.ssidLength, kept,
++                dropRange, drop6g, dropBand, scan.channels[0],
++                scan.channels[1], scan.channels[4], scan.channels[5]);
++            for (uint32_t i = 0; i < scan.channelCount && i < 24; ++i) {
++                const uint8_t *entry = raw + 0x58 + size_t(i) * 12;
++                XYLog("WCL scan diag ch[%u] channel=%u flags=0x%x\n", i,
++                    AirportWCL::read32(entry + 4),
++                    AirportWCL::read32(entry + 8));
++            }
++            diagScans++;
++        }
++    }
+     ieee80211com *ic = fHalService->get80211Controller();
+-    if (!(ic->ic_if.if_flags & IFF_RUNNING))
+-        return kIOReturnNotReady;
+-    if (scanPending || joinPending || (ic->ic_flags & IEEE80211_F_BGSCAN))
+-        return kIOReturnBusy;
+-    if (ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
+-        return kIOReturnBusy;
++    /*
++     * PATCH [local-p7]: a channel walk that gets interrupted by a join (or
++     * by a state change) can end without MCU_EVENT_SCAN_DONE ever arriving.
++     * scanPending then stays latched and every later request is answered
++     * with kIOReturnBusy: airportd reports "scanResultsCount=0" after
++     * ~13 ms and the Wi-Fi menu stays empty until the interface is power
++     * cycled.  Measured on 2026-11-08: after a disconnect/join storm the
++     * driver sat in S_SCAN with scan request 42 / scan done 40 and refused
++     * everything; setairportpower off/on was the only way out.
++     *
++     * So: repair the contradictory states instead of refusing forever, and
++     * log which condition was taken so the ioreg ring shows what latched.
++     * A healthy walk is capped at 12 s (scanSource timeout), so anything
++     * older than 18 s + 4 s of slack is definitely orphaned.
++     */
++    {
++        static uint32_t healLogs, rejectLogs;
++        uint64_t now = airport_up_time();
++
++        if (scanPending && wclScanDeadline != 0 &&
++            now > wclScanDeadline + 4000) {
++            if (healLogs < 24) {
++                XYLog("WCL scan self-heal: orphaned scanPending "
++                    "age=%llums results=%u state=%d idle=%d\n",
++                    now - (wclScanDeadline - 18000), wclScanResults,
++                    ic->ic_state, ic->ic_wcl_scan_idle);
++                healLogs++;
++            }
++            scanPending = false;
++            scanCompleted = false;
++            wclScanResults = 0;
++            scanSource->cancelTimeout();
++            ic->ic_wcl_scan_requested = false;
++        }
++        /* A cache bgscan can only be live while associated; anywhere at or
++         * below S_SCAN the flag is left over from an aborted transition. */
++        if ((ic->ic_flags & IEEE80211_F_BGSCAN) &&
++            ic->ic_state <= IEEE80211_S_SCAN) {
++            if (healLogs < 24) {
++                XYLog("WCL scan self-heal: stale bgscan flag in state %d\n",
++                    ic->ic_state);
++                healLogs++;
++            }
++            ic->ic_flags &= ~IEEE80211_F_BGSCAN;
++        }
++        if (!(ic->ic_if.if_flags & IFF_RUNNING)) {
++            if (rejectLogs < 12) {
++                XYLog("WCL scan reject: ifnet not running state=%d\n",
++                    ic->ic_state);
++                rejectLogs++;
++            }
++            return kIOReturnNotReady;
++        }
++        if (scanPending || joinPending ||
++            (ic->ic_flags & IEEE80211_F_BGSCAN)) {
++            if (rejectLogs < 12) {
++                XYLog("WCL scan reject busy: scanPending=%d joinPending=%d "
++                    "bgscan=%d state=%d idle=%d\n", scanPending, joinPending,
++                    !!(ic->ic_flags & IEEE80211_F_BGSCAN), ic->ic_state,
++                    ic->ic_wcl_scan_idle);
++                rejectLogs++;
++            }
++            return kIOReturnBusy;
++        }
++        if (ic->ic_state == IEEE80211_S_AUTH ||
++            ic->ic_state == IEEE80211_S_ASSOC) {
++            if (rejectLogs < 12) {
++                XYLog("WCL scan reject: authing state=%d\n", ic->ic_state);
++                rejectLogs++;
++            }
++            return kIOReturnBusy;
++        }
++    }
+     if (scan.channelCount) {
+         bool usable = false;
+         for (unsigned channel = 1; channel <= IEEE80211_CHAN_MAX; ++channel)
+@@ -280,6 +401,8 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
+     }
+     scanPending = true;
+     scanCompleted = false;
++    wclScanResults = 0;
++    wclScanDeadline = airport_up_time() + 18000;
+     scanSkipCompletion = ic->ic_state == IEEE80211_S_SCAN &&
+         ((scan.type != 2 && scan.ssidLength != 0) ||
+          ic->ic_wcl_scan_ssid_length != 0 || ic->ic_des_esslen != 0);
+@@ -289,7 +412,11 @@ IOReturn AirportItlwmSkywalkInterface::beginWCLScan(apple80211ScanRequest *reque
+     memcpy(ic->ic_wcl_scan_ssid, scan.ssid, sizeof(scan.ssid));
+     ic->ic_wcl_scan_restricted = scan.channelCount != 0;
+     memcpy(ic->ic_wcl_scan_channels, scan.channels, sizeof(scan.channels));
+-    scanSource->setTimeoutMS(20000);
++    /*
++     * Hard cap only; the timer is re-armed to a short quiet period every time
++     * a beacon is published, so a normal walk finishes seconds before this.
++     */
++    scanSource->setTimeoutMS(12000);
+     if (ic->ic_state == IEEE80211_S_RUN) {
+         ieee80211_begin_cache_bgscan(&ic->ic_if);
+         if (!(ic->ic_flags & IEEE80211_F_BGSCAN)) {
+@@ -319,17 +446,74 @@ void AirportItlwmSkywalkInterface::finishWCLScan(IOReturn status)
+ {
+     if (!scanPending)
+         return;
++    /*
++     * A scan that produced no beacon event still leaves the node tree full of
++     * APs from the channel walk.  Reporting success with zero results makes
++     * airportd replace its cache with an empty set, which is the "list goes
++     * blank for a moment" flicker in the Wi-Fi menu.
++     */
++    if (wclScanResults == 0)
++        publishWCLCachedResults();
+     scanPending = false;
+     scanCompleted = false;
++    wclScanResults = 0;
+     scanSource->cancelTimeout();
+     fHalService->get80211Controller()->ic_wcl_scan_requested = false;
+     instance->postMessage(this, AirportWCL::ScanDone, &status, sizeof(status), true);
++    /*
++     * PATCH [local-p15]: replay a join that arrived while this walk was
++     * still live.  scanPending is already cleared above, so the replayed
++     * request takes the normal path instead of deferring again.
++     */
++    if (joinDeferred)
++        resumeWCLJoin();
+ }
+ 
+ void AirportItlwmSkywalkInterface::completeWCLScan()
+ {
+-    if (!wclStopping)
+-        finishWCLScan(scanCompleted ? kIOReturnSuccess : kIOReturnTimeout);
++    if (wclStopping)
++        return;
++    /*
++     * MT7921 does deliver MCU_EVENT_SCAN_DONE, but it is dropped whenever the
++     * walk is started from a settled S_SCAN/S_RUN state or aborted early by a
++     * join, so this timer is often the only completion.  IO80211 has already
++     * ingested every beacon publishWCLBeacon() handed over, so once the walk
++     * went quiet with something collected, reporting success is accurate.
++     * The old code always reported kIOReturnTimeout in that case, which made
++     * airportd discard the whole cache and redraw an empty list.
++     */
++    finishWCLScan((scanCompleted || wclScanResults) ? kIOReturnSuccess
++                                                    : kIOReturnTimeout);
++}
++
++void AirportItlwmSkywalkInterface::publishWCLCachedResults()
++{
++    ieee80211com *ic = fHalService->get80211Controller();
++    struct ieee80211_node *ni;
++    uint32_t nodes = 0;
++
++    /*
++     * Events only publish beacons that arrive while the scan is running.  A
++     * scan started from a settled S_SCAN state finishes after the driver's
++     * channel walk, so most of the APs sitting in ic_tree never produced a
++     * beacon event during the window; the request then completed with
++     * "success, 0 results" and the UI stayed empty.  Re-serialise the SSID and
++     * RSN IEs from the node (the node keeps parsed state, not the raw frame)
++     * and hand every candidate over before ScanDone.
++     */
++    RB_FOREACH(ni, ieee80211_tree, &ic->ic_tree) {
++        if (nodes >= 96)
++            break;
++        uint8_t ies[256];
++        uint8_t *frm = ies;
++        frm = ieee80211_add_ssid(frm, ni->ni_essid, ni->ni_esslen);
++        if (ni->ni_rsnprotos != 0)
++            frm = ieee80211_add_rsn(frm, ic, ni);
++        publishWCLBeacon(ni, ies, size_t(frm - ies));
++        ++nodes;
++    }
++    XYLog("publishWCLCachedResults nodes=%u published=%u\n", nodes,
++        wclScanResults);
+ }
+ 
+ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, const uint8_t *ies, size_t length)
+@@ -368,6 +552,16 @@ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node,
+             memcpy(wclBssInfo, metadata, messageSize);
+         }
+     }
++    if (scanPending) {
++        ++wclScanResults;
++        /*
++         * Quiet-period completion: the channel walk is done once no new
++         * beacon has arrived for a while.  Bounded by wclScanDeadline so a
++         * busy radio cannot defer the completion forever.
++         */
++        if (airport_up_time() < wclScanDeadline)
++            scanSource->setTimeoutMS(1200);
++    }
+     instance->postMessage(this, AirportWCL::ScanResult, metadata, messageSize, true);
+     IOFree(metadata, size);
+ }
+@@ -471,14 +665,36 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
+         joinTimer->setTimeoutMS(30000);
+         return kIOReturnSuccess;
+     }
+-    if (!supported || !(ic->ic_if.if_flags & IFF_RUNNING) || joinPending || scanPending) {
++    if (!supported || !(ic->ic_if.if_flags & IFF_RUNNING) || joinPending) {
+         explicit_bzero(&join, sizeof(join));
+         return !supported ? kIOReturnUnsupported : kIOReturnBusy;
+     }
+-    if (ic->ic_state == IEEE80211_S_RUN || ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC)
++    /*
++     * PATCH [local-p15]: a live walk is only a few seconds of channel
++     * hopping.  Answering kIOReturnBusy makes airportd drop the request,
++     * issue leaveNetwork and retry - which tears down the link we are about
++     * to build and costs a full join-timeout cycle (16.1 s measured).
++     * Hold the request instead and replay it the moment the walk finishes
++     * (finishWCLScan -> resumeWCLJoin); joinTimer stays armed as the backstop.
++     */
++    if (scanPending) {
++        deferredJoin = join;
++        memcpy(joinBSSID, join.bssid, sizeof(joinBSSID));
++        explicit_bzero(&join, sizeof(join));
++        joinDeferred = joinPending = true;
++        assocNotified = firstBeaconNotified = portAuthorized = false;
++        joinTimer->setTimeoutMS(30000);
++        XYLog("WCL join: deferred behind running scan (state=%d)\n", ic->ic_state);
++        return kIOReturnSuccess;
++    }
++    if (ic->ic_state == IEEE80211_S_RUN || ic->ic_state == IEEE80211_S_AUTH || ic->ic_state == IEEE80211_S_ASSOC) {
++        XYLog("WCL leave: new join preempts state=%d\n", ic->ic_state);
+         leaveWCLNetwork();
++    }
+     ieee80211_disable_rsn(ic);
+     ieee80211_disable_wep(ic);
++    /* PATCH [local-p18]: pre-join wipe; the new key lands below and clears it */
++    ic->ic_wcl_psk_wiped = true;
+     explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
+     clearWCLPMKSA();
+     ic->ic_flags &= ~(IEEE80211_F_AUTO_JOIN | IEEE80211_F_PSK);
+@@ -554,6 +770,8 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
+     ic->ic_flags |= IEEE80211_F_DESBSSID;
+     ic->ic_wcl_join_requested = true;
+     ic->ic_wcl_scan_requested = false;
++    /* PATCH [local-p18]: a fresh join supersedes any earlier wipe */
++    ic->ic_wcl_psk_wiped = false;
+     current_authtype_lower = join.lowerAuth;
+     current_authtype_upper = join.upperAuth;
+     explicit_bzero(&join, sizeof(join));
+@@ -564,20 +782,75 @@ IOReturn AirportItlwmSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &joi
+     bzero(wclBeaconInfo, sizeof(wclBeaconInfo));
+     disassocIsVoluntary = false;
+     joinTimer->setTimeoutMS(30000);
+-    if (ic->ic_state == IEEE80211_S_SCAN && ic->ic_wcl_scan_idle) {
+-        // The stack waits for us between scans (ieee80211_end_scan).
+-        ic->ic_wcl_scan_idle = false;
+-        ieee80211_next_scan(&ic->ic_if);
+-    }
+     if (ic->ic_state != IEEE80211_S_SCAN && ic->ic_newstate(ic, IEEE80211_S_SCAN, -1)) {
+         joinPending = false;
+         joinTimer->cancelTimeout();
+         ic->ic_wcl_join_requested = false;
+         clearWCLPMKSA();
+         ic->ic_wcl_enterprise = false;
++        /* PATCH [local-p18]: deliberate wipe, keep the zero-PSK log quiet */
++        ic->ic_wcl_psk_wiped = true;
+         explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
+         return kIOReturnError;
+     }
++    /*
++     * PATCH [local-p15]: airportd hands us a BSSID it just picked out of its
++     * own scan results, so that node is normally already in ic_tree.  Walking
++     * every channel again just to find it costs the whole sweep (measured
++     * 5.4 s for 41 channels) and delays the first AUTH frame by exactly that
++     * much; combined with the 15 s join timeout it produces the bimodal
++     * 1.7 s / 16.1 s distribution seen on 2026-11-09.  Join the cached node
++     * directly and fall back to the walk only when the cache really misses.
++     */
++    {
++        struct ieee80211_node *cached = NULL;
++        if (ic->ic_bss != NULL && ic->ic_des_esslen != 0) {
++            struct ieee80211_node *ni = ieee80211_find_node(ic, joinBSSID);
++            /*
++             * PATCH [local-p17]: an entry can still be linked in ic_tree
++             * after leaveWCLNetwork() cleared its contents, in which case
++             * find_node() hands back a husk with ni_rsnprotos / akms /
++             * ciphers zeroed.  Joining it makes node_join_bss() copy an
++             * empty macaddr into ic_bss, and the AUTH retries then go to
++             * ff:ff:ff:ff:ff:ff for six rounds until the watchdog resets
++             * the state machine (measured 471.890: protos=0 akms=0
++             * ciphers=0, then "AUTH: pre-auth deauth sent to
++             * ff:ff:ff:ff:ff:ff", 20.9 s wasted).  Require a fully
++             * populated RSN node when RSN is on, and hold a reference for
++             * the duration of the join so the tree cannot free it
++             * underneath us.
++             */
++            if (ni != NULL && ni->ni_chan != NULL && ni->ni_rssi != 0 &&
++                (!(ic->ic_flags & IEEE80211_F_RSNON) ||
++                 ni->ni_rsnprotos != 0) &&
++                ni->ni_esslen == ic->ic_des_esslen &&
++                memcmp(ni->ni_essid, ic->ic_des_essid, ni->ni_esslen) == 0)
++                cached = ieee80211_ref_node(ni);
++            else if (ni != NULL)
++                XYLog("WCL join: cached node unusable "
++                      "protos=%d akms=%d ciphers=%d, scan instead\n",
++                      ni->ni_rsnprotos, ni->ni_rsnakms, ni->ni_rsnciphers);
++        }
++        if (cached != NULL) {
++            XYLog("WCL join: cached node hit rssi=%d chan=%d, skip scan\n",
++                  cached->ni_rssi, ieee80211_chan2ieee(ic, cached->ni_chan));
++            /*
++             * We are bypassing ieee80211_end_scan(), which is what normally
++             * clears the scan-in-progress flags.  Left behind they make the
++             * watchdog think a walk is still live.  Dropping F_BGSCAN here is
++             * safe for the same reason the self-heal in beginWCLScan() does it:
++             * a cache scan cannot be meaningful once we are at or below S_SCAN.
++             */
++            ic->ic_wcl_scan_idle = false;
++            ic->ic_flags &= ~(IEEE80211_F_ASCAN | IEEE80211_F_BGSCAN);
++            ieee80211_node_join_bss(ic, cached);
++            ieee80211_free_node(ic, cached);
++        } else if (ic->ic_wcl_scan_idle) {
++            // The stack waits for us between scans (ieee80211_end_scan).
++            ic->ic_wcl_scan_idle = false;
++            ieee80211_next_scan(&ic->ic_if);
++        }
++    }
+     return kIOReturnSuccess;
+ }
+ 
+@@ -601,6 +874,10 @@ void AirportItlwmSkywalkInterface::finishWCLJoin(uint16_t status, uint16_t reaso
+ {
+     if (!joinPending)
+         return;
++    /* PATCH [local-p11]: caller trace, so a bad round can be attributed */
++    XYLog("WCL join complete status=%u reason=%u driver=%d state=%d\n",
++          status, reason, (int)driverStatus,
++          fHalService->get80211Controller()->ic_state);
+     AirportWCL::ConnectionEvent event = {};
+     event.status = status;
+     event.reason = reason;
+@@ -618,7 +895,35 @@ void AirportItlwmSkywalkInterface::finishWCLJoin(uint16_t status, uint16_t reaso
+         ic->ic_wcl_join_requested = false;
+         clearWCLPMKSA();
+         ic->ic_wcl_enterprise = false;
++        /*
++         * PATCH [local-p18]: flag the wipe.  The zero-PSK guard in
++         * ieee80211_input.c cannot tell "we wiped it on purpose" from
++         * "the key vanished and the state machine is still running";
++         * without this bit every failed join produced a second, bogus
++         * "with no PMK ... re-auth cannot succeed" report (measured
++         * 8 bogus reports against 8 failed joins in the 5-round P17
++         * run) and buried the real signal.
++         */
++        ic->ic_wcl_psk_wiped = true;
+         explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
++        /*
++         * PATCH [local-p14]: the join is over, so stop the state machine
++         * too.  Wiping ic_psk here while leaving the driver in AUTH or
++         * ASSOC is what produced the "psk check 80" loop: debugPoll kept
++         * re-sending AUTH_REQ / ASSOC_REQ, the AP kept accepting them,
++         * and every 4-way ran on 32 zero bytes.  Parking in S_INIT also
++         * lets beginWCLScan() work again, which is what the reconnect
++         * needs in the first place.
++         */
++        if (ic->ic_state > IEEE80211_S_SCAN) {
++            XYLog("WCL join failed, parking in S_INIT (was state=%d)\n",
++                  ic->ic_state);
++            ieee80211_new_state(ic, IEEE80211_S_INIT, -1);
++        }
++    } else {
++        /* PATCH [local-p18]: the key is live again, so a later zero-PSK
++         * report is a genuine fault and must not be suppressed. */
++        fHalService->get80211Controller()->ic_wcl_psk_wiped = false;
+     }
+ }
+ 
+@@ -626,6 +931,8 @@ void AirportItlwmSkywalkInterface::wclJoinTimeout(OSObject *owner, IOTimerEventS
+ {
+     auto self = OSDynamicCast(AirportItlwmSkywalkInterface, owner);
+     if (self && !self->wclStopping) {
++        XYLog("WCL leave: join timeout fired (state=%d)\n",
++              self->fHalService->get80211Controller()->ic_state);
+         self->finishWCLJoin(1, 1004, kIOReturnTimeout);
+         self->leaveWCLNetwork();
+     }
+@@ -649,6 +956,8 @@ IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
+         ieee80211_new_state(ic, IEEE80211_S_SCAN, -1);
+     ieee80211_disable_rsn(ic);
+     ieee80211_disable_wep(ic);
++    /* PATCH [local-p18]: deliberate wipe on leave, not a fault */
++    ic->ic_wcl_psk_wiped = true;
+     explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
+     clearWCLPMKSA();
+     ic->ic_wcl_enterprise = false;
+@@ -660,6 +969,8 @@ IOReturn AirportItlwmSkywalkInterface::leaveWCLNetwork()
+ 
+ IOReturn AirportItlwmSkywalkInterface::abortWCLJoin()
+ {
++    XYLog("WCL leave: abort join request from airportd (state=%d joinPending=%d)\n",
++          fHalService->get80211Controller()->ic_state, (int)joinPending);
+     leaveWCLNetwork();
+     instance->postMessage(this, AirportWCL::JoinAbortComplete, nullptr, 0, true);
+     return kIOReturnSuccess;
+diff --git a/SimpleMtkWlan/hal_mwx/MtkMwx.cpp b/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
+index b70ff37..16fdaa1 100644
+--- a/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
++++ b/SimpleMtkWlan/hal_mwx/MtkMwx.cpp
+@@ -61,6 +61,18 @@ OSDefineMetaClassAndStructors(MtkMwx, MtkHalService)
+ #define NBPFILTER 0
+ #endif
+ 
++/*
++ * [local-p19] ic_wcl_preauth_deauth is an AIRPORT_WCL field, but the state
++ * machine below is compiled for both products.  Without the WCL front-end
++ * there is no pre-auth deauth to echo back, so the arm/disarm collapses to
++ * nothing -- net80211 would then never swallow a real deauth.
++ */
++#ifdef AIRPORT_WCL
++#define MWX_ARM_PREAUTH_DEAUTH(ic, v)	((ic)->ic_wcl_preauth_deauth = (v))
++#else
++#define MWX_ARM_PREAUTH_DEAUTH(ic, v)	((void)(ic), (void)(v))
++#endif
++
+ #define PCI_VENDOR_MEDIATEK            0x14c3
+ #define PCI_PRODUCT_MEDIATEK_MT7921    0x7961
+ #define PCI_PRODUCT_MEDIATEK_MT7921K   0x0608
+@@ -1551,7 +1563,7 @@ mwx_start(struct ifnet *ifp)
+ 	struct ether_header *eh;
+ 	struct mbuf *m;
+ 
+-	if (!(ifp->if_flags & IFF_RUNNING) || ifq_is_oactive(&ifp->if_snd))
++	if (!(ifp->if_flags & IFF_RUNNING))
+ 		return;
+ 
+ 	for (;;) {
+@@ -1573,6 +1585,28 @@ mwx_start(struct ifnet *ifp)
+ 			goto sendit;
+ 		}
+ 
++		/*
++		 * PATCH [local-p6]: ic_mgtq and if_snd are different queues.
++		 * The old code returned early whenever if_snd was oactive, so
++		 * an AUTH/ASSOC/DEAUTH waiting in ic_mgtq had to wait for the
++		 * next watchdog tick (measured 300-900 ms, far outside what an
++		 * AP tolerates between AUTH and ASSOC_REQ).  Management output
++		 * above always runs first; only data is held back here.
++		 *
++		 * Reaching this point means mwx_tx_has_room() succeeded just
++		 * above, so an oactive flag here is stale - the ring has room
++		 * again but nobody cleared the flag.  Clear it and carry on.
++		 */
++		if (ifq_is_oactive(&ifp->if_snd)) {
++			static uint32_t oactive_logs;
++			if (oactive_logs < 16) {
++				MWX_DEV_LOG(sc,
++				    "txstart stale oactive cleared after mgmt\n");
++				oactive_logs++;
++			}
++			ifq_clr_oactive(&ifp->if_snd);
++		}
++
+ 		if (ic->ic_state != IEEE80211_S_RUN ||
+ 		    (ic->ic_xflags & IEEE80211_F_TX_MGMT_ONLY))
+ 			break;
+@@ -1599,6 +1633,23 @@ mwx_start(struct ifnet *ifp)
+ 		if (ic->ic_rawbpf != NULL)
+ 			bpf_mtap(ic->ic_rawbpf, m, BPF_DIRECTION_OUT);
+ #endif
++		/* PATCH [local-p6]: prove whether a mgmt frame left the driver. */
++		{
++			struct ieee80211_frame *mwh =
++			    mtod(m, struct ieee80211_frame *);
++			if ((mwh->i_fc[0] & IEEE80211_FC0_TYPE_MASK) ==
++			    IEEE80211_FC0_TYPE_MGT) {
++				static uint32_t mgmt_logs;
++				if (mgmt_logs < 32) {
++					MWX_DEV_LOG(sc,
++					    "txstart mgmt subtype=0x%02x len=%zu state=%d\n",
++					    mwh->i_fc[0] &
++					    IEEE80211_FC0_SUBTYPE_MASK,
++					    mbuf_len(m), ic->ic_state);
++					mgmt_logs++;
++				}
++			}
++		}
+ 		int rv = mwx_tx(sc, m, ni);
+ 		/* mwx_tx copies node metadata into the descriptor; completion uses
+ 		 * the packet/token only, so release the enqueue reference here. */
+@@ -1857,6 +1908,9 @@ mwx_newstate_task(void *ptr)
+ 
+ 	switch (nstate) {
+ 	case IEEE80211_S_INIT:
++		/* PATCH [local-p19]: the join was abandoned; disarm the echo guard
++		 * so an unrelated deauth in a later attempt is not swallowed */
++		MWX_ARM_PREAUTH_DEAUTH(ic, false);
+ 		break;
+ 	case IEEE80211_S_SCAN:
+ 		rv = mwx_scan(sc);
+@@ -1864,6 +1918,35 @@ mwx_newstate_task(void *ptr)
+ 			break;
+ 		break;
+ 	case IEEE80211_S_AUTH:
++		/*
++		 * PATCH [local-p16]: entering AUTH means a join owns the radio
++		 * from here on.  A walk that is still hopping channels only
++		 * steals airtime from the AUTH / ASSOC exchange and, when it
++		 * completes before we reach RUN, makes ieee80211_end_scan()
++		 * restart the state machine (see mwx_end_scan_task).  Abort it
++		 * up front.  When the walk already finished this is a no-op:
++		 * mt7921_mcu_hw_scan_cancel() clears MWX_FLAG_SCANNING on
++		 * success but the flag is tested first.
++		 */
++		if (sc->sc_flags & MWX_FLAG_SCANNING) {
++			MWX_DEV_LOG(sc, "AUTH: aborting running scan\n");
++			mt7921_mcu_hw_scan_cancel(sc);
++		}
++		/*
++		 * PATCH [local-p10]: the AID of a finished association must
++		 * not survive into the next one.  ieee80211_recv_assoc_resp()
++		 * now drops ASSOC_RESP for an association whose AID is
++		 * already assigned (duplicate-response filter), so a stale
++		 * AID would make the next join look like a duplicate and be
++		 * silently ignored.  Only the S_SCAN branch of the net80211
++		 * state machine used to clear it, but the deauth / assoc
++		 * retry path is RUN -> AUTH -> ASSOC with no scan in between.
++		 */
++		if (ic->ic_bss != NULL && ic->ic_bss->ni_associd != 0) {
++			MWX_DEV_LOG(sc, "AUTH: clearing stale aid=%d\n",
++			    ic->ic_bss->ni_associd);
++			ic->ic_bss->ni_associd = 0;
++		}
+ 		rv = mt7921_set_channel(sc);
+ 		if (rv)
+ 			break;
+@@ -1883,9 +1966,34 @@ mwx_newstate_task(void *ptr)
+ 			IEEE80211_SEND_MGMT(ic, ic->ic_bss,
+ 			    IEEE80211_FC0_SUBTYPE_DEAUTH,
+ 			    IEEE80211_REASON_AUTH_LEAVE);
+-			mwx_start(&ic->ic_if);
++			/*
++			 * PATCH [local-p5]: mwx_start(&ic->ic_if) used to be
++			 * called here.  start() belongs to the ifnet queue
++			 * machinery and must not be driven from inside a state
++			 * transition; doing so left the tx queue in a state
++			 * where the ASSOC_REQ that net80211 queues ~40 ms later
++			 * was dropped, pushing the frame out to debugPoll's 1 s
++			 * timer instead (measured 296 ms).  The AP answers a
++			 * late ASSOC_REQ with deauth(reason 9) after ~300 ms, so
++			 * that delay is fatal; on the runs that worked the
++			 * AUTH -> ASSOC_REQ gap was 38 ms.
++			 */
+ 			MWX_DEV_LOG(sc, "AUTH: pre-auth deauth sent to %s\n",
+ 			    ether_sprintf(ic->ic_bss->ni_macaddr));
++			/*
++			 * PATCH [local-p19]: arm the echo guard.  Some APs
++			 * (measured on an Android hotspot) answer a
++			 * deauth(reason 3) with a deauth(reason 1) of their
++			 * own 23 ms later.  ieee80211_recv_deauth() hands any
++			 * deauth to ic_event_handler, so WCL reported it as
++			 * "join complete status=1" and tore down a join that
++			 * had not even sent AUTH yet -- every wrong-password
++			 * round burned its first attempt on this.  The flag
++			 * is cleared on entering S_ASSOC (auth really worked)
++			 * and on S_RUN/S_INIT, so a genuine deauth later in
++			 * the join is still processed normally.
++			 */
++			MWX_ARM_PREAUTH_DEAUTH(ic, true);
+ 		}
+ 		if (sc->sc_sta_added) {
+ 			int srv = mt7921_mac_sta_update(sc, sc->sc_ic.ic_bss, 0, 0);
+@@ -1897,11 +2005,52 @@ mwx_newstate_task(void *ptr)
+ 		break;
+ 	case IEEE80211_S_ASSOC:
+ 		mwx_mcu_set_deep_sleep(sc, 1);
++		/* PATCH [local-p19]: AUTH succeeded, so that window is closed and a
++		 * deauth from here on is the AP's real opinion of us. */
++		MWX_ARM_PREAUTH_DEAUTH(ic, false);
++		/*
++		 * PATCH [local-p5]: net80211 already sent ASSOC_REQ in its
++		 * S_AUTH -> S_ASSOC transition, but ieee80211_mgmt_output()
++		 * can fail there (tx queue not ready right after the AUTH
++		 * exchange) and the frame is simply dropped - no immediate
++		 * retry, only debugPoll's 1 s timer.  Re-sending here is
++		 * harmless when the first one did go out (duplicate
++		 * ASSOC_REQ just makes the AP resend ASSOC_RESP) and keeps
++		 * the AUTH -> ASSOC_REQ gap inside the AP's ~300 ms window.
++		 */
++		/*
++		 * PATCH [local-p9]: only resend when we are *entering*
++		 * S_ASSOC from AUTH.  A RUN -> ASSOC transition means the AP
++		 * just tore the association down (deauth/disassoc, e.g. the
++		 * wrong-key 4-way), and at that moment the AP has already
++		 * dropped our auth state - an ASSOC_REQ sent now is answered
++		 * with a fresh association (new AID) that we instantly
++		 * abandon, or with a "class 3 frame" deauth.  Measured in the
++		 * 10-round wrong-password test: every deauth reason 15 was
++		 * followed by "ASSOC: immediate resend" 30 ms later and the
++		 * AP still handed out a new associd before airportd moved to
++		 * S_SCAN.  net80211's own ASSOC_REQ from the AUTH -> ASSOC
++		 * transition is unaffected, so the 300 ms AP window this
++		 * patch chain cares about is unchanged.
++		 */
++		if (ostate != IEEE80211_S_RUN &&
++		    ic->ic_opmode == IEEE80211_M_STA && ic->ic_bss != NULL) {
++			int crv = ieee80211_send_mgmt(ic, ic->ic_bss,
++			    IEEE80211_FC0_SUBTYPE_ASSOC_REQ, 0, 0);
++			MWX_DEV_LOG(sc, "ASSOC: immediate resend rv=%d\n", crv);
++		} else if (ostate == IEEE80211_S_RUN &&
++		    ic->ic_opmode == IEEE80211_M_STA) {
++			MWX_DEV_LOG(sc, "ASSOC: skip resend, came from RUN "
++			    "(peer gone) aid=%d\n",
++			    ic->ic_bss != NULL ? ic->ic_bss->ni_associd : -1);
++		}
+ 		break;
+ 	case IEEE80211_S_RUN:
+ 		if (ic->ic_opmode == IEEE80211_M_MONITOR)
+ 			break;
+ 
++		/* PATCH [local-p19]: the join is over; nothing to guard any more */
++		MWX_ARM_PREAUTH_DEAUTH(ic, false);
+ 		mt7921_mcu_hw_scan_cancel(sc);
+ 		mwx_mcu_set_deep_sleep(sc, 0);
+ 		{
+@@ -1942,10 +2091,61 @@ mwx_newstate_task(void *ptr)
+ 		break;
+ 	}
+ 
+-	if (rv)
++	if (rv) {
+ 		mwx_reset(sc);
+-	else
++	} else {
+ 		sc->sc_newstate(ic, nstate, arg);
++		/*
++		 * PATCH [local-p6]: once the state machine is really in
++		 * S_ASSOC, repeat the ASSOC_REQ a couple of times, spaced
++		 * ~20 ms.  Every attempt that associated had a second
++		 * ASSOC_REQ arrive ~15 ms after the first; every attempt
++		 * that failed left the next one to debugPoll (300-900 ms),
++		 * which this AP answers with deauth(reason 9) because its
++		 * auth context has already expired.  Frames are only queued
++		 * here (they go out through mwx_start), so the short delay
++		 * simply lets the previous one clear the TX ring instead of
++		 * piling three copies into the same burst.
++		 */
++		if (nstate == IEEE80211_S_ASSOC && ostate != IEEE80211_S_RUN &&
++		    ic->ic_opmode == IEEE80211_M_STA && ic->ic_bss != NULL) {
++			int i;
++			for (i = 0; i < 2; i++) {
++				delay(20 * 1000);
++				/*
++				 * PATCH [local-p8]: ic_state lags the real
++				 * progress.  ieee80211_recv_assoc_resp()
++				 * sets ni_associd and only then calls
++				 * new_state(S_RUN); with the resend loop
++				 * sleeping here, the ASSOC_RESP can be
++				 * processed in between, so a resend fired
++				 * after a successful association.  The AP
++				 * treats the extra ASSOC_REQ as a fresh
++				 * association, drops our 4-way msg 2/4 and
++				 * the join stalls for the full 20 s
++				 * airportd timeout (-3912).  Measured:
++				 * 8/10 joins ok, 2/10 stalled exactly there
++				 * (log showed "paced resend 2" after
++				 * "recv_assoc_resp nstate=4").  So stop as
++				 * soon as the AID is assigned.
++				 */
++				if (ic->ic_state != IEEE80211_S_ASSOC)
++					break;
++				if (ic->ic_bss->ni_associd != 0) {
++					MWX_DEV_LOG(sc,
++					    "ASSOC: resend stopped, associd=%d\n",
++					    ic->ic_bss->ni_associd);
++					break;
++				}
++				int brv = ieee80211_send_mgmt(ic, ic->ic_bss,
++				    IEEE80211_FC0_SUBTYPE_ASSOC_REQ, 0, 0);
++				MWX_DEV_LOG(sc,
++				    "ASSOC: paced resend %d rv=%d state=%d aid=%d\n",
++				    i + 1, brv, ic->ic_state,
++				    ic->ic_bss->ni_associd);
++			}
++		}
++	}
+ 	splx(s);
+ }
+ 
+@@ -5870,6 +6070,14 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
+ 	int n_ssids = 0;
+ 	int rv;
+ 	uint8_t nchan, n_2g = 0, n_5g = 0;
++	/*
++	 * DIAG [scan-5g] (local, not upstream): when the request comes from
++	 * AirportWCL it is filtered by the channel bitmap the client sent.
++	 * "2g=14 5g=0" can therefore mean either "the adapter has no 5 GHz
++	 * channels" or "the bitmap selected none of them". Count both sides
++	 * so the log tells which one it is.
++	 */
++	unsigned avail_5g = 0, skipped_restricted = 0;
+ 
+ 	m = mwx_mcu_alloc_msg(sizeof(*req));
+ 	if (m == NULL)
+@@ -5931,11 +6139,16 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
+ 
+ 		if (c->ic_flags == 0)
+ 			continue;
++		if (IEEE80211_IS_CHAN_5GHZ(c))
++			avail_5g++;
+ #ifdef AIRPORT_WCL
+ 		if (!AirportWCL::scanChannelSelected(ic->ic_wcl_scan_channels,
+ 		    ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted,
+-		    ieee80211_mhz2ieee(c->ic_freq, 0)))
++		    ieee80211_mhz2ieee(c->ic_freq, 0))) {
++			if (IEEE80211_IS_CHAN_5GHZ(c))
++				skipped_restricted++;
+ 			continue;
++		}
+ #endif
+ 
+ 		if (nchan < 32)
+@@ -5989,12 +6202,19 @@ mt7921_mcu_hw_scan(struct mwx_softc *sc, int bgscan)
+ #endif
+ 
+ 	MWX_DEV_LOG(sc,
+-	    "scan request seq=%u channels=%u 2g=%u 5g=%u primary=%u ext=%u timeout=%u dwell=%u min_dwell=%u scan_func=0x%08x ssid_type=0x%x\n",
++	    "scan request seq=%u channels=%u 2g=%u 5g=%u primary=%u ext=%u timeout=%u dwell=%u min_dwell=%u scan_func=0x%08x ssid_type=0x%x has5g=%d avail5g=%u restricted=%d skipped5g=%u\n",
+ 	    sc->sc_scan_seq_num, nchan, n_2g, n_5g, req->channels_num,
+ 	    req->ext_channels_num, le16toh(req->timeout_value),
+ 	    le16toh(req->channel_dwell_time),
+ 	    le16toh(req->channel_min_dwell_time),
+-	    le32toh(req->scan_func), req->ssid_type);
++	    le32toh(req->scan_func), req->ssid_type,
++	    sc->sc_capa.has_5ghz, avail_5g,
++#ifdef AIRPORT_WCL
++	    ic->ic_wcl_scan_requested && ic->ic_wcl_scan_restricted,
++#else
++	    0,
++#endif
++	    skipped_restricted);
+ 
+ 	rv = mwx_mcu_send_mbuf(sc, MCU_CE_CMD_START_HW_SCAN, m, NULL);
+ 	if (rv != 0)
+@@ -6036,10 +6256,22 @@ mwx_end_scan_task(void *arg)
+ 	 * net80211 choose and re-join the BSS we had just associated to
+ 	 * (without a deauth), which the AP then ignored. Only background
+ 	 * scans may complete while associated.
++	 *
++	 * PATCH [local-p16]: the same staleness applies one state earlier.
++	 * A join started from the cached-node shortcut (WCL.cpp) enters AUTH
++	 * while the walk is still hopping channels, so scan completion lands
++	 * in S_AUTH/S_ASSOC instead of S_RUN.  ieee80211_end_scan() then
++	 * unconditionally selects a BSS and calls ieee80211_node_join_bss(),
++	 * which restarts the machine from AUTH and throws away the AUTH /
++	 * ASSOC frames already in flight: measured two wasted ASSOC_REQ
++	 * retries plus an association the AP kicked with reason 4
++	 * (inactivity) 40 ms after we reached RUN, worth 16.1 s per join.
++	 * Any state at or past AUTH means "a join owns the radio now".
+ 	 */
+-	if (ic->ic_state == IEEE80211_S_RUN &&
++	if (ic->ic_state >= IEEE80211_S_AUTH &&
+ 	    (ic->ic_flags & IEEE80211_F_BGSCAN) == 0) {
+-		MWX_DEV_LOG(sc, "ignoring stale scan completion in RUN\n");
++		MWX_DEV_LOG(sc, "ignoring stale scan completion in state %d\n",
++		    ic->ic_state);
+ 		splx(s);
+ 		return;
+ 	}
+@@ -9153,19 +9385,43 @@ MtkMwx::debugPoll()
+ 	 * frame (seen on 2.4 GHz: AUTH answered, ASSOC response never came)
+ 	 * thus cost ~20 s at boot. Retransmit like mac80211 does, once per
+ 	 * poll, up to three times.
++	 *
++	 * PATCH [arxusion-37aa87e] (Arxusion/AirportMtkWlan, 2026-11-04):
++	 * the cap above was unreachable. The counter was reset on every
++	 * ic_state change, and an AP that answers AUTH but drops ASSOC (or
++	 * sends a stale-session DISASSOC) flips AUTH <-> ASSOC every few
++	 * seconds, so `retries` never left 1..2 and the station retried
++	 * forever. Key the reset on the peer BSSID too, and give up by
++	 * returning to S_INIT once three rounds on the same peer are spent.
++	 * That stops the endless 4 s loop that redrew the Wi-Fi menu while
++	 * the user was still typing the password.
++	 *
++	 * PATCH [local-retry-window] (2026-11-08): the BSSID key alone did
++	 * not help -- the state still flipped AUTH<->ASSOC every round, so
++	 * `retry_state != ic_state` reset `retries` before it could ever
++	 * reach 2.  Measured on an AP that answers ASSOC with deauth(reason
++	 * 9): 34 AUTH and 36 ASSOC retries, all logged "retry 1".  Drop the
++	 * state term from the reset condition entirely and count retries per
++	 * peer only, so the budget is spent across both states (6 sends ~=
++	 * 12 s) and the loop terminates.  A peer change or any state outside
++	 * AUTH/ASSOC still resets the counter.
+ 	 */
+ 	{
+-		static int retry_state = -1, retries;
++		static int retries;
++		static uint8_t last_peer[IEEE80211_ADDR_LEN];
+ 
+ 		if (ic->ic_opmode == IEEE80211_M_STA && ic->ic_mgt_timer != 0 &&
+ 		    (ic->ic_state == IEEE80211_S_AUTH ||
+-		    ic->ic_state == IEEE80211_S_ASSOC)) {
+-			if (retry_state != ic->ic_state) {
+-				retry_state = ic->ic_state;
++		    ic->ic_state == IEEE80211_S_ASSOC) && ic->ic_bss != NULL) {
++			if (memcmp(last_peer, ic->ic_bss->ni_macaddr,
++			    IEEE80211_ADDR_LEN) != 0) {
++				memcpy(last_peer, ic->ic_bss->ni_macaddr,
++				    IEEE80211_ADDR_LEN);
+ 				retries = 0;
+-			} else if (retries < 3) {
++			}
++			if (retries < 6) {
+ 				retries++;
+-				MWX_DEV_LOG(sc, "%s retry %d to %s\n",
++				MWX_DEV_LOG(sc, "%s retry %d/6 to %s\n",
+ 				    ic->ic_state == IEEE80211_S_AUTH ?
+ 				    "AUTH" : "ASSOC", retries,
+ 				    ether_sprintf(ic->ic_bss->ni_macaddr));
+@@ -9175,9 +9431,106 @@ MtkMwx::debugPoll()
+ 				else
+ 					IEEE80211_SEND_MGMT(ic, ic->ic_bss,
+ 					    IEEE80211_FC0_SUBTYPE_ASSOC_REQ, 0);
++			} else {
++				MWX_DEV_LOG(sc, "retries exhausted for %s in "
++				    "state %d, resetting to S_INIT\n",
++				    ether_sprintf(ic->ic_bss->ni_macaddr),
++				    ic->ic_state);
++				retries = 0;
++				memset(last_peer, 0, IEEE80211_ADDR_LEN);
++				ieee80211_new_state(ic, IEEE80211_S_INIT, -1);
+ 			}
+-		} else
+-			retry_state = -1;
++		} else {
++			retries = 0;
++			memset(last_peer, 0, IEEE80211_ADDR_LEN);
++		}
++	}
++
++	/*
++	 * PATCH [local-p12]: a station parked in AUTH/ASSOC with
++	 * ic_mgt_timer == 0 is dead -- the retransmit block above needs a
++	 * live timer, and nothing else re-drives the state machine, so it
++	 * stays there until the radio is power cycled.  That is exactly
++	 * what a disassoc(RUN) + deauth(AUTH) pair did on 2026-11-09:
++	 * state=2 for 29 rounds, no "AUTH retry", every scan answered with
++	 * "WCL scan reject: authing state=2".  A state transition whose
++	 * entry action sends no frame legitimately leaves no timer behind
++	 * (see the P12 note in ieee80211_recv_disassoc()), so treat six
++	 * consecutive polls (~6 s) with no timer as a wedged machine and
++	 * restart from S_INIT.  A normal join always arms the timer within
++	 * the same transition, so this never fires on a healthy one.
++	 */
++	{
++		static int dead_polls;
++		static int dead_state;
++
++		if (ic->ic_opmode == IEEE80211_M_STA &&
++		    (ic->ic_state == IEEE80211_S_AUTH ||
++		     ic->ic_state == IEEE80211_S_ASSOC) &&
++		    ic->ic_mgt_timer == 0) {
++			if (dead_state != ic->ic_state) {
++				dead_state = ic->ic_state;
++				dead_polls = 0;
++			}
++			if (++dead_polls >= 6) {
++				MWX_DEV_LOG(sc, "dead state %d without mgt "
++				    "timer, resetting to S_INIT\n",
++				    ic->ic_state);
++				dead_polls = 0;
++				dead_state = -1;
++				ieee80211_new_state(ic, IEEE80211_S_INIT, -1);
++			}
++		} else {
++			dead_polls = 0;
++			dead_state = -1;
++		}
++	}
++
++	/*
++	 * PATCH [local-p14]: count RUN entries in a time window instead of
++	 * per peer / per node.
++	 *
++	 * The first cut of this guard keyed on ic_bss->ni_macaddr and reset
++	 * on "no ic_bss".  A disassoc drops the node, so ic_bss went NULL
++	 * between every cycle and the counter was cleared each time -- it
++	 * never reached the threshold even though the station entered RUN
++	 * 33 times in 150 s.  Anchor on time instead: a healthy association
++	 * enters RUN once and then stays there, so five entries inside 60 s
++	 * is unambiguously a handshake that can never complete.
++	 */
++	{
++		static uint64_t last_run_ns;
++		static uint64_t first_run_ns;
++		static int prev_state = -1;
++		static int run_entries;
++		uint64_t now_ns = 0;
++
++		absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
++		if (ic->ic_opmode == IEEE80211_M_STA &&
++		    ic->ic_state == IEEE80211_S_RUN &&
++		    prev_state != IEEE80211_S_RUN) {
++			if (first_run_ns == 0 ||
++			    now_ns - first_run_ns > 60000000000ULL) {
++				first_run_ns = now_ns;
++				run_entries = 0;
++			}
++			run_entries++;
++			last_run_ns = now_ns;
++			if (run_entries >= 5) {
++				MWX_DEV_LOG(sc, "reached RUN %d times in %llu ms, "
++				    "4-way never settles, resetting to S_INIT\n",
++				    run_entries,
++				    (unsigned long long)((now_ns - first_run_ns) /
++				    1000000ULL));
++				run_entries = 0;
++				first_run_ns = 0;
++				last_run_ns = 0;
++				prev_state = -1;
++				ieee80211_new_state(ic, IEEE80211_S_INIT, -1);
++			}
++		}
++		prev_state = ic->ic_state;
++		(void)last_run_ns;
+ 	}
+ 
+ 	sta = mwx_read(sc, MT_WFDMA0_HOST_INT_STA);
+diff --git a/mtk80211/openbsd/net80211/ieee80211_input.c b/mtk80211/openbsd/net80211/ieee80211_input.c
+index 87fa5f9..67fca4f 100644
+--- a/mtk80211/openbsd/net80211/ieee80211_input.c
++++ b/mtk80211/openbsd/net80211/ieee80211_input.c
+@@ -76,6 +76,19 @@
+ #include <net80211/ieee80211_var.h>
+ #include <net80211/ieee80211_priv.h>
+ 
++/*
++ * [local-p18] The zero-PMK guards below ask the WCL front-end whether *it*
++ * wiped ic_psk (failed join / leaveWCLNetwork) before shouting.  That flag
++ * only exists in the AIRPORT_WCL build -- net80211 is also compiled for the
++ * SimpleMtkWlan product, where nothing ever wipes the PSK behind our back,
++ * so the guard evaluates to "not wiped" and the log always fires.
++ */
++#ifdef AIRPORT_WCL
++#define MWX_SKIP_NO_PMK_LOG(ic)	((ic)->ic_wcl_psk_wiped)
++#else
++#define MWX_SKIP_NO_PMK_LOG(ic)	0
++#endif
++
+ mbuf_t ieee80211_input_hwdecrypt(struct ieee80211com *,
+                                  struct ieee80211_node *, mbuf_t,
+                                  struct ieee80211_rxinfo *rxi);
+@@ -2706,6 +2719,35 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, mbuf_t m,
+         return;
+     }
+     
++    /*
++     * PATCH [local-p10]: one association attempt receives one ASSOC_RESP
++     * per ASSOC_REQ we sent (net80211's own, mwx_newstate's immediate
++     * resend and the paced resends), and this AP answers every one of
++     * them, so two or three responses land within a few milliseconds.
++     *
++     * The S_ASSOC guard above cannot filter those: mwx_newstate() only
++     * queues the RUN transition on a task, so ic->ic_state is still
++     * IEEE80211_S_ASSOC while response #2 and #3 are parsed, and each
++     * duplicate re-runs the whole RUN entry (assoc_status, associated
++     * BSS, 80 MHz switch, beacon sync).  Measured: three
++     * recv_assoc_resp 6 ms apart at [975.266] [975.272] [975.273]; in
++     * the failing rounds the AP answers the repeated association with
++     * deauth(reason 13) and the node bounces AUTH/ASSOC/RUN until
++     * airportd gives up after 20 s (-3912).
++     *
++     * ni_associd is written by the first accepted response (a few lines
++     * below), so a non-zero AID here means this association already
++     * completed.  A fresh attempt always passes through S_SCAN (which
++     * zeroes it) or S_AUTH (cleared in mwx_newstate), so this cannot
++     * wedge a later join.
++     */
++    if (ni->ni_associd != 0) {
++        ic->ic_stats.is_rx_mgtdiscard++;
++        XYLog("%s duplicate assoc resp dropped (aid=%d)\n",
++              __FUNCTION__, ni->ni_associd);
++        return;
++    }
++    
+     /* make sure all mandatory fixed fields are present */
+     if (mbuf_len(m) < sizeof(*wh) + 6) {
+         DPRINTF(("frame too short\n"));
+@@ -2938,6 +2980,27 @@ ieee80211_recv_deauth(struct ieee80211com *ic, mbuf_t m,
+     
+     reason = LE_READ_2(frm);
+ 
++    /*
++     * PATCH [local-p19]: the deauth we send from the S_AUTH entry (so the AP
++     * drops any session it kept from before) is answered by some APs with a
++     * deauth of their own, 23 ms later and with reason 1.  That answer says
++     * nothing about the join we are about to start, but ic_event_handler
++     * passed it on as a failure, so WCL reported "join complete status=1"
++     * before AUTH had even been sent -- every wrong-password round burned
++     * its first attempt this way (measured 4/5 rounds on 2026-11-09).
++     * The flag is only armed by that send and cleared when AUTH succeeds,
++     * so a real deauth during S_ASSOC / S_RUN is still handled below.
++     */
++#ifdef AIRPORT_WCL
++    if (ic->ic_opmode == IEEE80211_M_STA && ic->ic_wcl_preauth_deauth &&
++        ic->ic_state == IEEE80211_S_AUTH) {
++        ic->ic_stats.is_rx_deauth++;
++        XYLog("Deauth reason %d ignored: echo of our pre-auth deauth in "
++              "S_AUTH (join still starting)\n", reason);
++        return;
++    }
++#endif
++
+     XYLog("Deauth received, reason %d\n", reason);
+     ic->ic_deauth_reason = reason;
+     if (ic->ic_event_handler) {
+@@ -2953,9 +3016,40 @@ ieee80211_recv_deauth(struct ieee80211com *ic, mbuf_t m,
+                         (ic->ic_flags & IEEE80211_F_DISABLE_BG_AUTO_CONNECT) == 0;
+             int stay_auth = ((ic->ic_userflags & IEEE80211_F_STAYAUTH) &&
+                              ic->ic_state >= IEEE80211_S_AUTH);
+-            if (!(roamscan || stay_auth))
+-                ieee80211_new_state(ic, IEEE80211_S_AUTH,
+-                                    IEEE80211_FC0_SUBTYPE_DEAUTH);
++            /*
++             * PATCH [local-p14]: same rule as the disassoc handler --
++             * once the PMK is gone there is nothing to authenticate
++             * with, so park in S_INIT and let airportd decide instead of
++             * running a handshake that is guaranteed to fail.  The state
++             * test matters: mwx_newstate() keeps a single pending target,
++             * so queueing S_AUTH here would overwrite the S_INIT that
++             * finishWCLJoin() just asked for.
++             */
++            if (!(roamscan || stay_auth)) {
++                static const u_int8_t zero_pmk[IEEE80211_PMK_LEN] = { 0 };
++                int nokey = ic->ic_state >= IEEE80211_S_AUTH &&
++                    memcmp(ic->ic_psk, zero_pmk,
++                        sizeof(zero_pmk)) == 0;
++
++                if (nokey) {
++                    /*
++                     * PATCH [local-p18]: only shout when the key went
++                     * missing on its own.  When the wipe was ours
++                     * (finishWCLJoin failure / leaveWCLNetwork) the
++                     * caller has already logged it and queued S_INIT;
++                     * reporting it again as "no PMK" turned the guard
++                     * into noise (8 bogus reports for 8 failed joins).
++                     */
++                    if (!MWX_SKIP_NO_PMK_LOG(ic))
++                        XYLog("Deauth reason %d with no PMK in state %d: "
++                              "stop, re-auth cannot succeed, S_INIT\n",
++                              reason, ic->ic_state);
++                    ieee80211_new_state(ic, IEEE80211_S_INIT, -1);
++                } else {
++                    ieee80211_new_state(ic, IEEE80211_S_AUTH,
++                                        IEEE80211_FC0_SUBTYPE_DEAUTH);
++                }
++            }
+         }
+             break;
+ #ifndef IEEE80211_STA_ONLY
+@@ -3019,9 +3113,80 @@ ieee80211_recv_disassoc(struct ieee80211com *ic, mbuf_t m,
+              * of ours, and jumping to ASSOC there loses the pending
+              * auth response.
+              */
+-            if (!roamscan && ic->ic_state >= IEEE80211_S_ASSOC)
+-                ieee80211_new_state(ic, IEEE80211_S_ASSOC,
+-                                    IEEE80211_FC0_SUBTYPE_DISASSOC);
++            /*
++             * PATCH [local-p11]: a disassoc that arrives while we are
++             * already RUN means the AP dropped a live association -- our
++             * authentication is gone with it.  Falling back to S_ASSOC
++             * there only re-sends ASSOC_REQ to an AP that has no state
++             * for us, so it stays silent and debugPoll burns its whole
++             * 6 x 1 s budget before resetting to S_INIT (measured:
++             * 6.0 s wasted, join then fails).  Re-authenticate instead,
++             * same path the deauth handler already uses.
++             */
++            /*
++             * PATCH [local-p12]: the argument must be DEAUTH, not
++             * DISASSOC.  ieee80211_newstate()'s S_AUTH entry only sends
++             * an AUTH request (and therefore only arms ic_mgt_timer)
++             * for mgt == AUTH or mgt == DEAUTH; with DISASSOC it falls
++             * into the default branch and sends nothing.  That left the
++             * driver in S_AUTH with ic_mgt_timer == 0, and debugPoll's
++             * retransmit block skips every state without a live timer,
++             * so the station hung there forever: measured 29 consecutive
++             * rounds with state=2, no AUTH retry, "WCL scan reject:
++             * authing state=2" on every scan, until the radio was power
++             * cycled.  DEAUTH lands on the "try to reauth" branch, which
++             * sends AUTH_REQ and arms the 5 s management timer.
++             */
++            /*
++             * PATCH [local-p14]: never re-authenticate once the PMK is
++             * gone.  finishWCLJoin() wipes ic_psk when airportd's join
++             * fails, but the state machine kept running: debugPoll
++             * re-sent AUTH_REQ, the AP accepted it, we associated, and
++             * the 4-way then derived a PTK from 32 zero bytes and failed
++             * every time.  Measured 2026-11-09: 33 RUN entries in 150 s,
++             * "psk check 80" (the hash of an all-zero key) on every
++             * pass, each pass resetting debugPoll's retry budget so the
++             * loop never ended, and beginWCLScan() answering "authing
++             * state=2" so the scan list stayed empty.
++             *
++             * The test is deliberately not "reason 15" and not "state ==
++             * RUN": an AP can also kick a live session for a reason 15 we
++             * recover from by re-authenticating with a valid PMK, and a
++             * disassoc often lands in ASSOC rather than RUN.  What makes
++             * the retry pointless is only the missing key.
++             */
++            if (!roamscan) {
++                static const u_int8_t zero_pmk[IEEE80211_PMK_LEN] = { 0 };
++                int nokey = memcmp(ic->ic_psk, zero_pmk,
++                    sizeof(zero_pmk)) == 0;
++
++                if (nokey && ic->ic_state >= IEEE80211_S_AUTH) {
++                    /*
++                     * The check cannot depend on being in RUN: mwx_newstate()
++                     * keeps a single pending target (sc_ns_state), so a
++                     * S_AUTH queued right after finishWCLJoin()'s S_INIT
++                     * simply overwrites it and the loop resumes.
++                     */
++                    /* PATCH [local-p18]: see the deauth handler -- the
++                     * wipe we caused ourselves is already reported by
++                     * its caller, so do not dress it up as a fault. */
++                    if (!MWX_SKIP_NO_PMK_LOG(ic))
++                        XYLog("Disassoc reason %d with no PMK in state %d: "
++                              "stop, re-auth cannot succeed, S_INIT\n",
++                              reason, ic->ic_state);
++                    ieee80211_new_state(ic, IEEE80211_S_INIT, -1);
++                } else if (ic->ic_state == IEEE80211_S_RUN) {
++                    XYLog("Disassoc while RUN, reason %d: back to AUTH "
++                          "(psk check %02x)\n", reason,
++                          ieee80211_key_check(ic->ic_psk,
++                                              IEEE80211_PMK_LEN));
++                    ieee80211_new_state(ic, IEEE80211_S_AUTH,
++                                        IEEE80211_FC0_SUBTYPE_DEAUTH);
++                } else if (ic->ic_state >= IEEE80211_S_ASSOC) {
++                    ieee80211_new_state(ic, IEEE80211_S_ASSOC,
++                                        IEEE80211_FC0_SUBTYPE_DISASSOC);
++                }
++            }
+         }
+             break;
+ #ifndef IEEE80211_STA_ONLY
+diff --git a/mtk80211/openbsd/net80211/ieee80211_node.c b/mtk80211/openbsd/net80211/ieee80211_node.c
+index cd14b98..e19bf6a 100644
+--- a/mtk80211/openbsd/net80211/ieee80211_node.c
++++ b/mtk80211/openbsd/net80211/ieee80211_node.c
+@@ -681,8 +681,30 @@ ieee80211_set_ess(struct ieee80211com *ic, struct ieee80211_ess *ess,
+     ieee80211_disable_rsn(ic);
+     
+     if (ess->flags & IEEE80211_F_RSNON) {
+-        explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
+-        memcpy(ic->ic_psk, ess->psk, sizeof(ic->ic_psk));
++        /*
++         * PATCH [local-p13]: do not let an ESS entry without a key wipe
++         * the PSK the WCL join path just installed.
++         *
++         * ess->psk is only ever filled by the legacy ieee80211_add_ess()
++         * ioctl path; a join coming through AirportItlwmSkywalkInterface
++         * writes the PMK straight into ic_psk and never touches the ESS.
++         * Switching to such an entry therefore copied 32 zero bytes over a
++         * perfectly good key.  Measured 2026-11-09: WCL join logged
++         * "key check b0" (right password), 600 ms later the 4-way ran with
++         * "key check 80" -- that is the hash of 32 zero bytes -- so the AP
++         * rejected our msg 2/4 nine times in a row and the station never
++         * left the reconnect loop.
++         */
++        static const u_int8_t nokey[IEEE80211_PMK_LEN] = { 0 };
++        if (memcmp(ess->psk, nokey, sizeof(nokey)) == 0 &&
++            memcmp(ic->ic_psk, nokey, sizeof(nokey)) != 0) {
++            XYLog("set_ess: ESS has no PSK, keeping the joined key "
++                  "(check %02x)\n",
++                  ieee80211_key_check(ic->ic_psk, IEEE80211_PMK_LEN));
++        } else {
++            explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
++            memcpy(ic->ic_psk, ess->psk, sizeof(ic->ic_psk));
++        }
+         
+         ic->ic_rsnprotos = ess->rsnprotos;
+         ic->ic_rsnakms = ess->rsnakms;
+diff --git a/mtk80211/openbsd/net80211/ieee80211_var.h b/mtk80211/openbsd/net80211/ieee80211_var.h
+index 8e54343..ad3216d 100644
+--- a/mtk80211/openbsd/net80211/ieee80211_var.h
++++ b/mtk80211/openbsd/net80211/ieee80211_var.h
+@@ -451,6 +451,13 @@ struct ieee80211com {
+     bool ic_wcl_mac_reconfig;
+     bool ic_wcl_enterprise;
+     bool ic_wcl_join_requested;
++    /* [local-p18] set when we ourselves wiped ic_psk (failed join, leave),
++     * so the zero-PSK guard in ieee80211_input.c stays a real fault signal */
++    bool ic_wcl_psk_wiped;
++    /* [local-p19] armed while S_AUTH is entered from S_SCAN: the pre-auth
++     * deauth we send there makes some APs answer with a deauth of their own,
++     * which must not be mistaken for "the AP rejected our join" */
++    bool ic_wcl_preauth_deauth;
+     bool ic_wcl_scan_requested;
+     bool ic_wcl_roam_locked; /* WCL roam_off: persist across cache scans */
+     bool ic_wcl_scan_active;

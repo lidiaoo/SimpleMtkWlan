@@ -1,0 +1,95 @@
+diff --git a/AirportMtkWlan/WCL/WCL.cpp b/AirportMtkWlan/WCL/WCL.cpp
+index 01b1fb1..45cf9bf 100644
+--- a/AirportMtkWlan/WCL/WCL.cpp
++++ b/AirportMtkWlan/WCL/WCL.cpp
+@@ -451,10 +451,15 @@ void AirportItlwmSkywalkInterface::finishWCLScan(IOReturn status)
+      * APs from the channel walk.  Reporting success with zero results makes
+      * airportd replace its cache with an empty set, which is the "list goes
+      * blank for a moment" flicker in the Wi-Fi menu.
++     *
++     * PATCH [local-p23]: the walk no longer publishes each beacon as it
++     * arrives, so the full result set is handed over here in one burst,
++     * strongest signal first.  scanPending has to be cleared before that or
++     * publishWCLBeacon() would only count the nodes again instead of sending
++     * them.
+      */
+-    if (wclScanResults == 0)
+-        publishWCLCachedResults();
+     scanPending = false;
++    publishWCLCachedResults();
+     scanCompleted = false;
+     wclScanResults = 0;
+     scanSource->cancelTimeout();
+@@ -501,16 +506,51 @@ void AirportItlwmSkywalkInterface::publishWCLCachedResults()
+      * RSN IEs from the node (the node keeps parsed state, not the raw frame)
+      * and hand every candidate over before ScanDone.
+      */
++    /*
++     * PATCH [local-p23]: two things made the menu list feel arbitrary and
++     * jumpy.
++     *
++     * 1. The walk published every beacon from publishWCLBeacon() the moment
++     *    it arrived, i.e. in channel order.  preinit() fills 2.4 GHz first,
++     *    so the list was always built weak-2.4-first and the strong 5 GHz APs
++     *    landed at the bottom -- exactly "the one with good signal is last".
++     *    It also meant 120-156 separate ScanResult messages spread over the
++     *    5.7 s walk, so any list opened mid-scan was rebuilt under the
++     *    cursor.  Collection is now deferred to finishWCLScan() and sorted
++     *    by RSSI, so the menu sees one burst per scan, strongest first.
++     *
++     * 2. The 96 node cap was applied in BSSID order -- the tree's own order
++     *    -- and ic_tree holds ~200 nodes on this machine.  Every AP whose
++     *    BSSID sorted past the cap was invisible no matter how strong it
++     *    was.  The whole tree is published now.
++     */
++    struct ieee80211_node *list[256];
+     RB_FOREACH(ni, ieee80211_tree, &ic->ic_tree) {
+-        if (nodes >= 96)
++        if (nodes >= sizeof(list) / sizeof(list[0]))
+             break;
++        if (ni->ni_esslen > 32)
++            continue;
++        if (!ni->ni_chan || ni->ni_chan == IEEE80211_CHAN_ANYC)
++            continue;
++        list[nodes++] = ni;
++    }
++    /* Insertion sort, strongest first; nodes <= 256 so O(n^2) is cheap. */
++    for (unsigned i = 1; i < nodes; ++i) {
++        struct ieee80211_node *key = list[i];
++        unsigned j = i;
++        while (j > 0 && list[j - 1]->ni_rssi < key->ni_rssi) {
++            list[j] = list[j - 1];
++            --j;
++        }
++        list[j] = key;
++    }
++    for (unsigned i = 0; i < nodes; ++i) {
+         uint8_t ies[256];
+         uint8_t *frm = ies;
+-        frm = ieee80211_add_ssid(frm, ni->ni_essid, ni->ni_esslen);
+-        if (ni->ni_rsnprotos != 0)
+-            frm = ieee80211_add_rsn(frm, ic, ni);
+-        publishWCLBeacon(ni, ies, size_t(frm - ies));
+-        ++nodes;
++        frm = ieee80211_add_ssid(frm, list[i]->ni_essid, list[i]->ni_esslen);
++        if (list[i]->ni_rsnprotos != 0)
++            frm = ieee80211_add_rsn(frm, ic, list[i]);
++        publishWCLBeacon(list[i], ies, size_t(frm - ies));
+     }
+     XYLog("publishWCLCachedResults nodes=%u published=%u\n", nodes,
+         wclScanResults);
+@@ -561,6 +601,14 @@ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node,
+          */
+         if (airport_up_time() < wclScanDeadline)
+             scanSource->setTimeoutMS(1200);
++        /*
++         * PATCH [local-p23]: collect during the walk, publish afterwards.
++         * Sending here meant one message per beacon in channel order, which
++         * both kept rebuilding the menu mid-scan and put the strong 5 GHz
++         * APs last.  finishWCLScan() now emits the sorted set in one burst.
++         */
++        IOFree(metadata, size);
++        return;
+     }
+     instance->postMessage(this, AirportWCL::ScanResult, metadata, messageSize, true);
+     IOFree(metadata, size);

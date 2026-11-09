@@ -1,0 +1,60 @@
+--- a/AirportMtkWlan/WCL/WCL.cpp	2026-11-09 17:07:33
++++ b/AirportMtkWlan/WCL/WCL.cpp	2026-11-09 17:06:34
+@@ -571,11 +571,21 @@
+             return 0;
+     }
+ 
+-    *frm++ = IEEE80211_ELEMID_DSPARMS;
+-    *frm++ = 1;
+-    *frm++ = uint8_t(channel);
+-    if (frm > limit)
+-        return 0;
++    /*
++     * PATCH [local-p29]: DS Params exists only in 2.4 GHz beacons; a real
++     * 5 GHz beacon never carries it.  Emitting it for 5 GHz nodes produced
++     * a malformed beacon and gave airportd a channel record that names a
++     * 5 GHz channel inside a 2.4G-only element -- the kind of mismatch that
++     * ends up in known-network profiles and later steers join-time directed
++     * scans at the wrong band.
++     */
++    if (IEEE80211_IS_CHAN_2GHZ(ni->ni_chan)) {
++        *frm++ = IEEE80211_ELEMID_DSPARMS;
++        *frm++ = 1;
++        *frm++ = uint8_t(channel);
++        if (frm > limit)
++            return 0;
++    }
+ 
+     if (ni->ni_flags & IEEE80211_NODE_HTCAP) {
+         *frm++ = IEEE80211_ELEMID_HTCAPS;
+--- a/SimpleMtkWlan/hal_mwx/MtkMwx.cpp	2026-11-09 17:07:32
++++ b/SimpleMtkWlan/hal_mwx/MtkMwx.cpp	2026-11-09 17:06:54
+@@ -6300,6 +6300,28 @@
+ 
+ 	/* wildcard BSSID */
+ 	memset(req->bssid, 0xff, ETHER_ADDR_LEN);
++#ifdef AIRPORT_WCL
++	/*
++	 * PATCH [local-p29]: identify the target of directed (named) scan
++	 * requests.  airportd derives the join-time channel bitmap from its
++	 * per-network records, so a 5 GHz network probed with a 2.4G-only
++	 * bitmap can never be found; the SSID in the log is how that failure
++	 * gets attributed to the right network.
++	 */
++	if (ic->ic_wcl_scan_requested && ic->ic_wcl_scan_ssid_length > 0) {
++		char ssidbuf[IEEE80211_NWID_LEN + 1];
++		unsigned sblen = ic->ic_wcl_scan_ssid_length;
++		if (sblen > IEEE80211_NWID_LEN)
++			sblen = IEEE80211_NWID_LEN;
++		for (unsigned k = 0; k < sblen; ++k) {
++			uint8_t ch = ic->ic_wcl_scan_ssid[k];
++			ssidbuf[k] = (ch >= 0x20 && ch < 0x7f) ? (char)ch : '.';
++		}
++		ssidbuf[sblen] = '\0';
++		MWX_DEV_LOG(sc, "scan target ssid=\"%s\" len=%u\n",
++		    ssidbuf, ic->ic_wcl_scan_ssid_length);
++	}
++#endif
+ #ifdef NOTYET
+ 	if (sreq->flags & NL80211_SCAN_FLAG_RANDOM_ADDR) {
+ 		get_random_mask_addr(req->random_mac, sreq->mac_addr,

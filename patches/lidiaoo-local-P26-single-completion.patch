@@ -1,0 +1,142 @@
+diff --git a/AirportMtkWlan/WCL/WCL.cpp b/AirportMtkWlan/WCL/WCL.cpp
+diff --git a/AirportMtkWlan/AirportItlwmSkywalkInterface.hpp b/AirportMtkWlan/AirportItlwmSkywalkInterface.hpp
+--- a/AirportMtkWlan/WCL/WCL.cpp
++++ b/AirportMtkWlan/WCL/WCL.cpp
+@@ -78,6 +78,15 @@
+ 
+ bool AirportItlwmSkywalkInterface::initWCL()
+ {
++    /*
++     * PATCH [local-p26]: "-mtk-allwifi" publishes the whole candidate tree
++     * instead of the strongest 40.  Presence of the flag is enough; no value
++     * is read from it, matching the "-novht" / "-noht40" convention.
++     */
++    int allwifi = 0;
++    wclPublishAll = PE_parse_boot_argn("-mtk-allwifi", &allwifi, sizeof(allwifi));
++    if (wclPublishAll)
++        XYLog("WCL: -mtk-allwifi set, scan list is not capped\n");
+     joinTimer = IOTimerEventSource::timerEventSource(this, wclJoinTimeout);
+     if (!joinTimer)
+         return false;
+@@ -347,6 +356,7 @@
+             }
+             scanPending = false;
+             scanCompleted = false;
++            scanQuietWaits = 0;
+             wclScanResults = 0;
+             scanSource->cancelTimeout();
+             ic->ic_wcl_scan_requested = false;
+@@ -401,6 +411,7 @@
+     }
+     scanPending = true;
+     scanCompleted = false;
++    scanQuietWaits = 0;
+     wclScanResults = 0;
+     wclScanDeadline = airport_up_time() + 18000;
+     scanSkipCompletion = ic->ic_state == IEEE80211_S_SCAN &&
+@@ -459,8 +470,17 @@
+      * them.
+      */
+     scanPending = false;
++    /*
++     * PATCH [local-p26]: one line per completion.  Two of these for a single
++     * "scan request seq=" means the quiet timer and SCAN_DONE each finished
++     * the walk; the bounded wait in completeWCLScan() should collapse them.
++     */
++    XYLog("WCL scan finish status=0x%x completed=%d results=%u waits=%u "
++        "age=%llums\n", status, scanCompleted, wclScanResults, scanQuietWaits,
++        airport_up_time() - (wclScanDeadline - 18000));
+     publishWCLCachedResults();
+     scanCompleted = false;
++    scanQuietWaits = 0;
+     wclScanResults = 0;
+     scanSource->cancelTimeout();
+     fHalService->get80211Controller()->ic_wcl_scan_requested = false;
+@@ -477,7 +497,22 @@
+ void AirportItlwmSkywalkInterface::completeWCLScan()
+ {
+     if (wclStopping)
++        return;
++    /*
++     * PATCH [local-p26]: the quiet period can expire while the firmware walk
++     * is still on its last channels -- measured 0.68 s before SCAN_DONE.
++     * Finishing there reported the request twice (a half-swept list first,
++     * then the real one) and made airportd rebuild the menu both times.
++     * Wait briefly for the real event; two 400 ms re-arms cover the measured
++     * gap, and the hard deadline still ends a scan whose SCAN_DONE was
++     * dropped, so nothing can hang.
++     */
++    if (!scanCompleted && scanQuietWaits < 2 &&
++        airport_up_time() + 900 < wclScanDeadline) {
++        ++scanQuietWaits;
++        scanSource->setTimeoutMS(400);
+         return;
++    }
+     /*
+      * MT7921 does deliver MCU_EVENT_SCAN_DONE, but it is dropped whenever the
+      * walk is started from a settled S_SCAN/S_RUN state or aborted early by a
+@@ -657,7 +692,27 @@
+         }
+         list[j] = key;
+     }
+-    unsigned logged = 0, skipped = 0;
++    /*
++     * PATCH [local-p27]: hand the panel a short list.  The tree holds 200+
++     * candidates in a dense neighbourhood and the menu became unreadable
++     * ("138 networks, can't even browse them").  Everything past the cap is
++     * too weak to join anyway; the associated BSSID is pinned to the last
++     * slot so airportd never loses sight of the current network.
++     */
++    const uint32_t wclPublishCap = 40;
++    if (!wclPublishAll && nodes > wclPublishCap) {
++        struct ieee80211_node *keep =
++            (assocNotified && ic->ic_bss) ? ic->ic_bss : nullptr;
++        if (keep) {
++            for (unsigned i = wclPublishCap; i < nodes; ++i)
++                if (list[i] == keep) {
++                    list[wclPublishCap - 1] = keep;
++                    break;
++                }
++        }
++        nodes = wclPublishCap;
++    }
++    unsigned logged = 0, skipped = 0, sent = 0;
+     for (unsigned i = 0; i < nodes; ++i) {
+         /*
+          * PATCH [local-p25]: hand over a beacon-shaped element list instead
+@@ -679,10 +734,11 @@
+             ++logged;
+         }
+         publishWCLBeacon(list[i], ies, length);
++        ++sent;
+     }
+-    XYLog("publishWCLCachedResults nodes=%u 2g=%u 5g=%u published=%u "
+-        "skipped=%u maxnodes=%d\n", nodes, n2g, n5g, wclScanResults,
+-        skipped, ic->ic_max_nnodes);
++    XYLog("publishWCLCachedResults nodes=%u cap=%u sent=%u 2g=%u 5g=%u "
++        "skipped=%u maxnodes=%d\n", nodes, wclPublishAll ? 0 : wclPublishCap,
++        sent, n2g, n5g, skipped, ic->ic_max_nnodes);
+ }
+ 
+ void AirportItlwmSkywalkInterface::publishWCLBeacon(const ieee80211_node *node, const uint8_t *ies, size_t length)
+--- a/AirportMtkWlan/AirportItlwmSkywalkInterface.hpp
++++ b/AirportMtkWlan/AirportItlwmSkywalkInterface.hpp
+@@ -461,6 +461,18 @@
+     bool scanPending;
+     bool scanCompleted;
+     bool scanSkipCompletion;
++    /*
++     * PATCH [local-p26]: the quiet-period timer can expire before the MCU
++     * reports SCAN_DONE, which completed one request twice and reported the
++     * list from a half-swept walk.  Counts the bounded re-arms spent waiting
++     * for the real completion, so a dropped event still ends the scan.
++     */
++    uint32_t scanQuietWaits = 0;
++    /*
++     * PATCH [local-p26]: "-mtk-allwifi" lifts the publish cap so the panel
++     * lists every candidate in the tree, not just the strongest 40.
++     */
++    bool wclPublishAll = false;
+     bool wclBssValid;
+     bool wclLinkIndicated;
+     uint8_t wclBssInfo[sizeof(AirportWCL::BeaconMetadata) + 0x800];

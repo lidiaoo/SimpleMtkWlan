@@ -1545,6 +1545,26 @@ ieee80211_end_scan(struct _ifnet *ifp)
         return;
     }
     
+    /*
+     * PATCH [local-p28]: macOS owns every join.  With no live WCL join
+     * request, end_scan must not pick a BSS on its own -- neither for the
+     * initial association (the empty-tree case above already idles, but a
+     * 500-entry cache tree defeated that check) nor for a background roam.
+     * A stale desired ESS from an aborted join request used to auto-auth
+     * out of the node tree and form a zombie association airportd never
+     * learned about.  Just drop the bgscan marker; airportd reconnects
+     * with a fresh join request when it sees the link go down.
+     */
+    if (!ic->ic_wcl_join_requested) {
+        if (bgscan)
+            ic->ic_flags &= ~IEEE80211_F_BGSCAN;
+        else if (ic->ic_state != IEEE80211_S_RUN) {
+            ieee80211_reset_scan(ifp);
+            ic->ic_wcl_scan_idle = true;
+        }
+        return;
+    }
+
     /* Possibly switch which ssid we are associated with */
     if (!bgscan && ic->ic_opmode == IEEE80211_M_STA)
         ieee80211_switch_ess(ic);
