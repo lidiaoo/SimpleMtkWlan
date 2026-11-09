@@ -449,6 +449,13 @@ private:
     void finishWCLScan(IOReturn);
     void finishWCLJoin(uint16_t, uint16_t, IOReturn);
     void publishWCLBeacon(const ieee80211_node *, const uint8_t *, size_t);
+    /*
+     * IO80211 only learns about networks through the ScanResult messages we
+     * post; the driver's own node tree is not read by the framework.  When a
+     * scan window closes without a single beacon event the tree may still hold
+     * every AP of the channel walk, so flush it before reporting completion.
+     */
+    void publishWCLCachedResults();
     IOTimerEventSource *joinTimer;
     uint8_t joinBSSID[6];
     bool scanPending;
@@ -461,6 +468,13 @@ private:
     uint32_t wclAssociatedBeacons = 0;
     uint32_t wclLqmBeacons = 0;
     uint32_t wclLqmReportedBeacons = 0;
+    /*
+     * Beacons accepted for the in-flight WCL scan, and the hard deadline
+     * (in airport_up_time() ms) after which quiet-period completion stops
+     * being deferred.
+     */
+    uint32_t wclScanResults = 0;
+    uint64_t wclScanDeadline = 0;
     int wclReportedLinkQuality = -2;
     ifnet_t wclLinkQualityInterface = nullptr;
     bool joinPending;

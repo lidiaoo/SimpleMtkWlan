@@ -451,6 +451,13 @@ struct ieee80211com {
     bool ic_wcl_mac_reconfig;
     bool ic_wcl_enterprise;
     bool ic_wcl_join_requested;
+    /* [local-p18] set when we ourselves wiped ic_psk (failed join, leave),
+     * so the zero-PSK guard in ieee80211_input.c stays a real fault signal */
+    bool ic_wcl_psk_wiped;
+    /* [local-p19] armed while S_AUTH is entered from S_SCAN: the pre-auth
+     * deauth we send there makes some APs answer with a deauth of their own,
+     * which must not be mistaken for "the AP rejected our join" */
+    bool ic_wcl_preauth_deauth;
     bool ic_wcl_scan_requested;
     bool ic_wcl_roam_locked; /* WCL roam_off: persist across cache scans */
     bool ic_wcl_scan_active;

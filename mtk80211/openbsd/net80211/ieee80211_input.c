@@ -76,6 +76,19 @@
 #include <net80211/ieee80211_var.h>
 #include <net80211/ieee80211_priv.h>
 
+/*
+ * [local-p18] The zero-PMK guards below ask the WCL front-end whether *it*
+ * wiped ic_psk (failed join / leaveWCLNetwork) before shouting.  That flag
+ * only exists in the AIRPORT_WCL build -- net80211 is also compiled for the
+ * SimpleMtkWlan product, where nothing ever wipes the PSK behind our back,
+ * so the guard evaluates to "not wiped" and the log always fires.
+ */
+#ifdef AIRPORT_WCL
+#define MWX_SKIP_NO_PMK_LOG(ic)	((ic)->ic_wcl_psk_wiped)
+#else
+#define MWX_SKIP_NO_PMK_LOG(ic)	0
+#endif
+
 mbuf_t ieee80211_input_hwdecrypt(struct ieee80211com *,
                                  struct ieee80211_node *, mbuf_t,
                                  struct ieee80211_rxinfo *rxi);
@@ -2706,6 +2719,35 @@ ieee80211_recv_assoc_resp(struct ieee80211com *ic, mbuf_t m,
         return;
     }
     
+    /*
+     * PATCH [local-p10]: one association attempt receives one ASSOC_RESP
+     * per ASSOC_REQ we sent (net80211's own, mwx_newstate's immediate
+     * resend and the paced resends), and this AP answers every one of
+     * them, so two or three responses land within a few milliseconds.
+     *
+     * The S_ASSOC guard above cannot filter those: mwx_newstate() only
+     * queues the RUN transition on a task, so ic->ic_state is still
+     * IEEE80211_S_ASSOC while response #2 and #3 are parsed, and each
+     * duplicate re-runs the whole RUN entry (assoc_status, associated
+     * BSS, 80 MHz switch, beacon sync).  Measured: three
+     * recv_assoc_resp 6 ms apart at [975.266] [975.272] [975.273]; in
+     * the failing rounds the AP answers the repeated association with
+     * deauth(reason 13) and the node bounces AUTH/ASSOC/RUN until
+     * airportd gives up after 20 s (-3912).
+     *
+     * ni_associd is written by the first accepted response (a few lines
+     * below), so a non-zero AID here means this association already
+     * completed.  A fresh attempt always passes through S_SCAN (which
+     * zeroes it) or S_AUTH (cleared in mwx_newstate), so this cannot
+     * wedge a later join.
+     */
+    if (ni->ni_associd != 0) {
+        ic->ic_stats.is_rx_mgtdiscard++;
+        XYLog("%s duplicate assoc resp dropped (aid=%d)\n",
+              __FUNCTION__, ni->ni_associd);
+        return;
+    }
+    
     /* make sure all mandatory fixed fields are present */
     if (mbuf_len(m) < sizeof(*wh) + 6) {
         DPRINTF(("frame too short\n"));
@@ -2938,6 +2980,27 @@ ieee80211_recv_deauth(struct ieee80211com *ic, mbuf_t m,
     
     reason = LE_READ_2(frm);
 
+    /*
+     * PATCH [local-p19]: the deauth we send from the S_AUTH entry (so the AP
+     * drops any session it kept from before) is answered by some APs with a
+     * deauth of their own, 23 ms later and with reason 1.  That answer says
+     * nothing about the join we are about to start, but ic_event_handler
+     * passed it on as a failure, so WCL reported "join complete status=1"
+     * before AUTH had even been sent -- every wrong-password round burned
+     * its first attempt this way (measured 4/5 rounds on 2026-11-09).
+     * The flag is only armed by that send and cleared when AUTH succeeds,
+     * so a real deauth during S_ASSOC / S_RUN is still handled below.
+     */
+#ifdef AIRPORT_WCL
+    if (ic->ic_opmode == IEEE80211_M_STA && ic->ic_wcl_preauth_deauth &&
+        ic->ic_state == IEEE80211_S_AUTH) {
+        ic->ic_stats.is_rx_deauth++;
+        XYLog("Deauth reason %d ignored: echo of our pre-auth deauth in "
+              "S_AUTH (join still starting)\n", reason);
+        return;
+    }
+#endif
+
     XYLog("Deauth received, reason %d\n", reason);
     ic->ic_deauth_reason = reason;
     if (ic->ic_event_handler) {
@@ -2953,9 +3016,40 @@ ieee80211_recv_deauth(struct ieee80211com *ic, mbuf_t m,
                         (ic->ic_flags & IEEE80211_F_DISABLE_BG_AUTO_CONNECT) == 0;
             int stay_auth = ((ic->ic_userflags & IEEE80211_F_STAYAUTH) &&
                              ic->ic_state >= IEEE80211_S_AUTH);
-            if (!(roamscan || stay_auth))
-                ieee80211_new_state(ic, IEEE80211_S_AUTH,
-                                    IEEE80211_FC0_SUBTYPE_DEAUTH);
+            /*
+             * PATCH [local-p14]: same rule as the disassoc handler --
+             * once the PMK is gone there is nothing to authenticate
+             * with, so park in S_INIT and let airportd decide instead of
+             * running a handshake that is guaranteed to fail.  The state
+             * test matters: mwx_newstate() keeps a single pending target,
+             * so queueing S_AUTH here would overwrite the S_INIT that
+             * finishWCLJoin() just asked for.
+             */
+            if (!(roamscan || stay_auth)) {
+                static const u_int8_t zero_pmk[IEEE80211_PMK_LEN] = { 0 };
+                int nokey = ic->ic_state >= IEEE80211_S_AUTH &&
+                    memcmp(ic->ic_psk, zero_pmk,
+                        sizeof(zero_pmk)) == 0;
+
+                if (nokey) {
+                    /*
+                     * PATCH [local-p18]: only shout when the key went
+                     * missing on its own.  When the wipe was ours
+                     * (finishWCLJoin failure / leaveWCLNetwork) the
+                     * caller has already logged it and queued S_INIT;
+                     * reporting it again as "no PMK" turned the guard
+                     * into noise (8 bogus reports for 8 failed joins).
+                     */
+                    if (!MWX_SKIP_NO_PMK_LOG(ic))
+                        XYLog("Deauth reason %d with no PMK in state %d: "
+                              "stop, re-auth cannot succeed, S_INIT\n",
+                              reason, ic->ic_state);
+                    ieee80211_new_state(ic, IEEE80211_S_INIT, -1);
+                } else {
+                    ieee80211_new_state(ic, IEEE80211_S_AUTH,
+                                        IEEE80211_FC0_SUBTYPE_DEAUTH);
+                }
+            }
         }
             break;
 #ifndef IEEE80211_STA_ONLY
@@ -3019,9 +3113,80 @@ ieee80211_recv_disassoc(struct ieee80211com *ic, mbuf_t m,
              * of ours, and jumping to ASSOC there loses the pending
              * auth response.
              */
-            if (!roamscan && ic->ic_state >= IEEE80211_S_ASSOC)
-                ieee80211_new_state(ic, IEEE80211_S_ASSOC,
-                                    IEEE80211_FC0_SUBTYPE_DISASSOC);
+            /*
+             * PATCH [local-p11]: a disassoc that arrives while we are
+             * already RUN means the AP dropped a live association -- our
+             * authentication is gone with it.  Falling back to S_ASSOC
+             * there only re-sends ASSOC_REQ to an AP that has no state
+             * for us, so it stays silent and debugPoll burns its whole
+             * 6 x 1 s budget before resetting to S_INIT (measured:
+             * 6.0 s wasted, join then fails).  Re-authenticate instead,
+             * same path the deauth handler already uses.
+             */
+            /*
+             * PATCH [local-p12]: the argument must be DEAUTH, not
+             * DISASSOC.  ieee80211_newstate()'s S_AUTH entry only sends
+             * an AUTH request (and therefore only arms ic_mgt_timer)
+             * for mgt == AUTH or mgt == DEAUTH; with DISASSOC it falls
+             * into the default branch and sends nothing.  That left the
+             * driver in S_AUTH with ic_mgt_timer == 0, and debugPoll's
+             * retransmit block skips every state without a live timer,
+             * so the station hung there forever: measured 29 consecutive
+             * rounds with state=2, no AUTH retry, "WCL scan reject:
+             * authing state=2" on every scan, until the radio was power
+             * cycled.  DEAUTH lands on the "try to reauth" branch, which
+             * sends AUTH_REQ and arms the 5 s management timer.
+             */
+            /*
+             * PATCH [local-p14]: never re-authenticate once the PMK is
+             * gone.  finishWCLJoin() wipes ic_psk when airportd's join
+             * fails, but the state machine kept running: debugPoll
+             * re-sent AUTH_REQ, the AP accepted it, we associated, and
+             * the 4-way then derived a PTK from 32 zero bytes and failed
+             * every time.  Measured 2026-11-09: 33 RUN entries in 150 s,
+             * "psk check 80" (the hash of an all-zero key) on every
+             * pass, each pass resetting debugPoll's retry budget so the
+             * loop never ended, and beginWCLScan() answering "authing
+             * state=2" so the scan list stayed empty.
+             *
+             * The test is deliberately not "reason 15" and not "state ==
+             * RUN": an AP can also kick a live session for a reason 15 we
+             * recover from by re-authenticating with a valid PMK, and a
+             * disassoc often lands in ASSOC rather than RUN.  What makes
+             * the retry pointless is only the missing key.
+             */
+            if (!roamscan) {
+                static const u_int8_t zero_pmk[IEEE80211_PMK_LEN] = { 0 };
+                int nokey = memcmp(ic->ic_psk, zero_pmk,
+                    sizeof(zero_pmk)) == 0;
+
+                if (nokey && ic->ic_state >= IEEE80211_S_AUTH) {
+                    /*
+                     * The check cannot depend on being in RUN: mwx_newstate()
+                     * keeps a single pending target (sc_ns_state), so a
+                     * S_AUTH queued right after finishWCLJoin()'s S_INIT
+                     * simply overwrites it and the loop resumes.
+                     */
+                    /* PATCH [local-p18]: see the deauth handler -- the
+                     * wipe we caused ourselves is already reported by
+                     * its caller, so do not dress it up as a fault. */
+                    if (!MWX_SKIP_NO_PMK_LOG(ic))
+                        XYLog("Disassoc reason %d with no PMK in state %d: "
+                              "stop, re-auth cannot succeed, S_INIT\n",
+                              reason, ic->ic_state);
+                    ieee80211_new_state(ic, IEEE80211_S_INIT, -1);
+                } else if (ic->ic_state == IEEE80211_S_RUN) {
+                    XYLog("Disassoc while RUN, reason %d: back to AUTH "
+                          "(psk check %02x)\n", reason,
+                          ieee80211_key_check(ic->ic_psk,
+                                              IEEE80211_PMK_LEN));
+                    ieee80211_new_state(ic, IEEE80211_S_AUTH,
+                                        IEEE80211_FC0_SUBTYPE_DEAUTH);
+                } else if (ic->ic_state >= IEEE80211_S_ASSOC) {
+                    ieee80211_new_state(ic, IEEE80211_S_ASSOC,
+                                        IEEE80211_FC0_SUBTYPE_DISASSOC);
+                }
+            }
         }
             break;
 #ifndef IEEE80211_STA_ONLY

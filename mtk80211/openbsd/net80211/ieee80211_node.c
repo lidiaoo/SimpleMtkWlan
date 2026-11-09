@@ -681,8 +681,30 @@ ieee80211_set_ess(struct ieee80211com *ic, struct ieee80211_ess *ess,
     ieee80211_disable_rsn(ic);
     
     if (ess->flags & IEEE80211_F_RSNON) {
-        explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
-        memcpy(ic->ic_psk, ess->psk, sizeof(ic->ic_psk));
+        /*
+         * PATCH [local-p13]: do not let an ESS entry without a key wipe
+         * the PSK the WCL join path just installed.
+         *
+         * ess->psk is only ever filled by the legacy ieee80211_add_ess()
+         * ioctl path; a join coming through AirportItlwmSkywalkInterface
+         * writes the PMK straight into ic_psk and never touches the ESS.
+         * Switching to such an entry therefore copied 32 zero bytes over a
+         * perfectly good key.  Measured 2026-11-09: WCL join logged
+         * "key check b0" (right password), 600 ms later the 4-way ran with
+         * "key check 80" -- that is the hash of 32 zero bytes -- so the AP
+         * rejected our msg 2/4 nine times in a row and the station never
+         * left the reconnect loop.
+         */
+        static const u_int8_t nokey[IEEE80211_PMK_LEN] = { 0 };
+        if (memcmp(ess->psk, nokey, sizeof(nokey)) == 0 &&
+            memcmp(ic->ic_psk, nokey, sizeof(nokey)) != 0) {
+            XYLog("set_ess: ESS has no PSK, keeping the joined key "
+                  "(check %02x)\n",
+                  ieee80211_key_check(ic->ic_psk, IEEE80211_PMK_LEN));
+        } else {
+            explicit_bzero(ic->ic_psk, sizeof(ic->ic_psk));
+            memcpy(ic->ic_psk, ess->psk, sizeof(ic->ic_psk));
+        }
         
         ic->ic_rsnprotos = ess->rsnprotos;
         ic->ic_rsnakms = ess->rsnakms;
